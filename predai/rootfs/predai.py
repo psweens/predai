@@ -182,17 +182,23 @@ class Prophet:
 
         return dataset, value
     
-    async def train(self, dataset, future_periods, n_lags=0, country=None):
-        """
-        Train the model on the dataset.
-        """
+    async def train(self, dataset, future_periods, n_lags=0, country=None, covariates_data=None):
         self.model = NeuralProphet(n_lags=n_lags, yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=True)
+    
+        # Add country holidays if specified
         if country:
-            print("Adding country holidays for {}".format(country))
             self.model.add_country_holidays(country)
-        # Fit the model on the dataset (this might take a bit)
+        
+        # Add covariates (regressors)
+        if covariates_data:
+            for covariate_name, covariate_dataset in covariates_data.items():
+                self.model = self.model.add_regressor(covariate_name)
+                dataset = dataset.merge(covariate_dataset, on='ds', how='left')
+        
+        # Train the model
         self.metrics = self.model.fit(dataset, freq=(str(self.period) + "min"), progress=None)
-        # Create a new dataframe reaching 96 into the future for our forecast, n_historic_predictions also shows historic data
+        
+        # Create future dataframe for prediction
         self.df_future = self.model.make_future_dataframe(dataset, n_historic_predictions=True, periods=future_periods)
         self.forecast = self.model.predict(self.df_future)
         print(self.forecast)
@@ -277,18 +283,18 @@ class Database():
 
     async def create_table(self, table):
         """
-        Create a table in the database by table if it does not exist.
+        Create a table in the database by table name if it does not exist.
         """
-        print("Create table {}".format(table))
-        self.cur.execute("CREATE TABLE IF NOT EXISTS {} (timestamp TEXT PRIMARY KEY, value REAL)".format(table))
+        print(f"Create table {table}")
+        self.cur.execute(f"CREATE TABLE IF NOT EXISTS {table} (timestamp TEXT PRIMARY KEY, value REAL)")
         self.con.commit()
 
     async def get_history(self, table):
         """
         Get the history from the database, sorted by timestamp.
-        Returns a Dataframe with the history data.
+        Returns a DataFrame with the history data.
         """
-        self.cur.execute("SELECT * FROM {} ORDER BY timestamp".format(table))
+        self.cur.execute(f"SELECT * FROM {table} ORDER BY timestamp")
         rows = self.cur.fetchall()
         history = pd.DataFrame(columns=["ds", "y"])
         if not rows:
@@ -304,23 +310,21 @@ class Database():
         Store the history in the database.
         Only the data associated with TIMESTAMPs not already in the database will be stored.
         Returns the updated history DataFrame.
-
-        :param table: The table to store the history in.
-        :param history: The history data as a DataFrame.
         """
         added_rows = 0
-        prev_values = prev["ds"].values
+        prev_values = prev["ds"].values if prev is not None else []
         prev_values = prev_values.tolist()
 
         for index, row in history.iterrows():
             timestamp = str(row["ds"])
             value = row["y"]
             if timestamp not in prev_values:
-                prev.loc[len(prev)] = {"ds": timestamp, "y": value}
-                self.cur.execute("INSERT INTO {} (timestamp, value) VALUES ('{}', {})".format(table, timestamp, value))
+                if prev is not None:
+                    prev.loc[len(prev)] = {"ds": timestamp, "y": value}
+                self.cur.execute(f"INSERT INTO {table} (timestamp, value) VALUES ('{timestamp}', {value})")
                 added_rows += 1
         self.con.commit()
-        print("Added {} rows to database table {}".format(added_rows, table))
+        print(f"Added {added_rows} rows to database table {table}")
         return prev
 
 async def print_dataset(name, dataset):
@@ -333,27 +337,48 @@ async def print_dataset(name, dataset):
         if count > 24:
             break
 
-async def get_history(interface, nw, sensor_name, now, incrementing, max_increment, days, use_db, reset_low, reset_high):
-    """
-    Get history from HA, combine it with the database if use_db is True.
-    """
+async def get_history(interface, nw, sensor, now, use_db):
+    sensor_name = sensor['name']
+    incrementing = sensor.get('incrementing', False)
+    max_increment = sensor.get('max_increment', 0)
+    days = sensor.get('days', 7)
+    reset_low = sensor.get('reset_low', 0.0)
+    reset_high = sensor.get('reset_high', 0.0)
+
+    # Fetch primary sensor data
     dataset, start, end = await interface.get_history(sensor_name, now, days=days)
     dataset, last_dataset_value = await nw.process_dataset(sensor_name, dataset, start, end, incrementing=incrementing, max_increment=max_increment, reset_low=reset_low, reset_high=reset_high)
 
+    # Store history in the database if required
     if use_db:
-        table_name = sensor_name.replace(".", "_")  # SQLite does not like dots in table names
+        table_name = sensor_name.replace(".", "_")
         db = Database()
         await db.create_table(table_name)
         prev = await db.get_history(table_name)
         dataset = await db.store_history(table_name, dataset, prev)
-        print("Stored dataset in database and retrieved full history from database length {}".format(len(dataset)))
-    return dataset, start, end
+
+    # Process covariates
+    covariates_data = {}
+    if 'covariates' in sensor:
+        covariates = sensor['covariates']
+        for covariate in covariates:
+            covariate_name = covariate.get('name')
+            cov_incrementing = covariate.get('incrementing', False)
+            cov_days = covariate.get('days', days)
+            
+            # Fetch and process covariate data
+            covariate_dataset, cov_start, cov_end = await interface.get_history(covariate_name, now, days=cov_days)
+            covariate_dataset, _ = await nw.process_dataset(covariate_name, covariate_dataset, cov_start, cov_end, incrementing=cov_incrementing)
+            covariates_data[covariate_name] = covariate_dataset
+
+    return dataset, start, end, covariates_data
     
 async def main():
     """
     Main function for the prediction AI.
     """
     interface = HAInterface()
+    # Main function loop
     while True:
         config = yaml.safe_load(open("/config/predai.yaml"))
         if not config:
@@ -378,22 +403,20 @@ async def main():
                 max_increment = sensor.get("max_increment", 0)
                 n_lags = sensor.get("n_lags", 0)
                 country = sensor.get("country", None)
-
+    
                 if not sensor_name:
                     continue
-
-                
+    
                 nw = Prophet(interval)
                 now = datetime.now(timezone.utc).astimezone()
-                now=now.replace(second=0, microsecond=0, minute=0)
-                
-
-                print("Update at time {} Processing sensor {} incrementing {} max_increment {} reset_daily {} interval {} days {} export_days {} subtract {}".format(now, sensor_name, incrementing, max_increment, reset_daily, interval, days, export_days, subtract_names))
-
-                # Get the data
-                dataset, start, end = await get_history(interface, nw, sensor_name, now, incrementing, max_increment, days, use_db, reset_low, reset_high)
-
-                # Get the subtract data
+                now = now.replace(second=0, microsecond=0, minute=0)
+    
+                print(f"Update at time {now}, processing sensor {sensor_name}, incrementing {incrementing}")
+    
+                # Get sensor data and covariates
+                dataset, start, end, covariates_data = await get_history(interface, nw, sensor, now, use_db)
+    
+                # Get and process subtract data (if any)
                 subtract_data_list = []
                 if subtract_names:
                     if isinstance(subtract_names, str):
@@ -401,18 +424,18 @@ async def main():
                     for subtract_name in subtract_names:
                         subtract_data, sub_start, sub_end = await get_history(interface, nw, subtract_name, now, incrementing, max_increment, days, use_db, reset_low, reset_high)
                         subtract_data_list.append(subtract_data)
-
-                # Subtract the data
+    
                 if subtract_data_list:
                     print("Subtracting data")
                     for subtract_data in subtract_data_list:
                         dataset = await subtract_set(dataset, subtract_data, now, incrementing=incrementing)
-
-                # Start training
-                await nw.train(dataset, future_periods, n_lags=n_lags, country=country)
-
+    
+                # Train the model with dataset and covariates
+                await nw.train(dataset, future_periods, n_lags=n_lags, country=country, covariates_data=covariates_data)
+    
                 # Save the prediction
                 await nw.save_prediction(sensor_name + "_prediction", now, interface, start=end, incrementing=incrementing, reset_daily=reset_daily, units=units, days=export_days)
+
 
         time_now = datetime.now(timezone.utc).astimezone()
         await interface.set_state("sensor.predai_last_run", state=str(time_now), attributes={"unit_of_measurement": "time"})
