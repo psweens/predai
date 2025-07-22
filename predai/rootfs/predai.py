@@ -408,7 +408,14 @@ class HistoryDB:
     def store_history(self, table: str, history: pd.DataFrame, prev: pd.DataFrame) -> pd.DataFrame:
         t = self.safe_name(table)
         self.create_table(t)
-        prev_values = set(str(x) for x in prev["ds"].astype(str).tolist())
+        # Normalise previously stored timestamps to the same ISO format that we
+        # use when inserting new rows. ``str(dt)`` would produce a space between
+        # date and time ("YYYY-MM-DD HH:MM:SS+00:00"), whereas ``isoformat()``
+        # yields "YYYY-MM-DDTHH:MM:SS+00:00".  The mismatch allowed duplicates to
+        # slip past the "timestamp_s not in prev_values" check and triggered
+        # SQLite UNIQUE constraint errors.  Build the set using ``isoformat`` so
+        # comparisons are consistent.
+        prev_values = set(dt.isoformat() for dt in prev["ds"] if pd.notna(dt))
         added = 0
         for _, row in history.iterrows():
             timestamp = pd.to_datetime(row["ds"], utc=True, errors="coerce")
