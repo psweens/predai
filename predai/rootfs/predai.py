@@ -395,6 +395,8 @@ class HistoryDB:
 
     def get_history(self, table: str) -> pd.DataFrame:
         t = self.safe_name(table)
+        # Ensure the table exists so the SELECT does not fail on first run
+        self.create_table(t)
         self.cur.execute(f"SELECT * FROM {t} ORDER BY timestamp")
         rows = self.cur.fetchall()
         if not rows:
