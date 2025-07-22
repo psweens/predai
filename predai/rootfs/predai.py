@@ -613,11 +613,15 @@ def horizon_agg(yhat_interval: Sequence[float], interval_min: int, minutes_ahead
 
 def make_entity_name(prefix: str, base: str, suffix: Optional[str] = None) -> str:
     """Return a valid Home Assistant entity_id for publishing state."""
-    base = base.replace(".", "_")
+    if prefix.startswith("sensor."):
+        prefix = prefix[7:]
+    prefix = re.sub(r"[^a-z0-9_]+", "_", prefix.lower())
+    base = re.sub(r"[^a-z0-9_]+", "_", base.lower())
     parts = [prefix + base]
     if suffix:
-        parts.append(suffix)
+        parts.append(str(suffix))
     object_id = "_".join(parts)
+    object_id = re.sub(r"_+", "_", object_id).strip("_")
     return f"sensor.{object_id}"
 
 
