@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import json
+
 import numpy as np
 import pandas as pd
 import yaml
@@ -322,12 +324,13 @@ class HAInterface:
         }
         try:
             async with sess.request(method, url, headers=headers, params=params, json=json_data) as resp:
+                text = await resp.text()
                 if resp.status >= 400:
-                    logger.warning("HA API %s %s -> %s", method, endpoint, resp.status)
+                    logger.warning("HA API %s %s -> %s: %s", method, endpoint, resp.status, text)
                 try:
-                    return await resp.json()
-                except aiohttp.ContentTypeError:
-                    logger.error("Non‑JSON response from %s", url)
+                    return json.loads(text) if text else None
+                except json.JSONDecodeError:
+                    logger.error("Non‑JSON response from %s: %s", url, text)
                     return None
         except aiohttp.client_exceptions.ClientError as e:
             logger.error("HA API error %s %s: %s", method, endpoint, e)
@@ -360,7 +363,7 @@ class HAInterface:
         return item.get("state", default)
 
     async def set_state(self, entity_id: str, state: Any, attributes: Optional[dict] = None):
-        data = {"state": state}
+        data = {"state": str(state)}
         if attributes:
             data["attributes"] = attributes
         await self.api_call("POST", f"/api/states/{entity_id}", json_data=data)
@@ -612,11 +615,16 @@ def horizon_agg(yhat_interval: Sequence[float], interval_min: int, minutes_ahead
 
 
 def make_entity_name(prefix: str, base: str, suffix: Optional[str] = None) -> str:
-    base = base.replace(".", "_")
+    """Return a valid Home Assistant ``entity_id`` for publishing state."""
+    prefix = re.sub(r"^sensor[._]", "", prefix, flags=re.IGNORECASE)
+    prefix = re.sub(r"[^a-z0-9_]+", "_", prefix.lower())
+    base = re.sub(r"[^a-z0-9_]+", "_", base.lower())
     parts = [prefix + base]
     if suffix:
-        parts.append(suffix)
-    return "_".join(parts)
+        parts.append(str(suffix))
+    object_id = "_".join(parts)
+    object_id = re.sub(r"_+", "_", object_id).strip("_")
+    return f"sensor.{object_id}"
 
 
 def dict_from_series(index: Sequence[datetime], values: Sequence[float], tz: timezone) -> Dict[str, float]:
