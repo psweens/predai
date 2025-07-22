@@ -612,11 +612,13 @@ def horizon_agg(yhat_interval: Sequence[float], interval_min: int, minutes_ahead
 
 
 def make_entity_name(prefix: str, base: str, suffix: Optional[str] = None) -> str:
+    """Return a valid Home Assistant entity_id for publishing state."""
     base = base.replace(".", "_")
     parts = [prefix + base]
     if suffix:
         parts.append(suffix)
-    return "_".join(parts)
+    object_id = "_".join(parts)
+    return f"sensor.{object_id}"
 
 
 def dict_from_series(index: Sequence[datetime], values: Sequence[float], tz: timezone) -> Dict[str, float]:
