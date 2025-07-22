@@ -841,6 +841,7 @@ async def run_sensor_job(sensor: SensorCfg,
 
         # Future frame
         df_future = backend.make_future(train_df, periods=steps)
+        df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
         fut_mask = df_future["ds"] > train_df["ds"].max()
         if fut_mask.any():
             fut_idx = pd.to_datetime(df_future.loc[fut_mask, "ds"], utc=True)
