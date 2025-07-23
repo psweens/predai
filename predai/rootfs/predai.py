@@ -59,6 +59,8 @@ DEFAULT_PUBLISH_PREFIX = "predai_"
 DEFAULT_INTERVAL_MIN = 30
 DEFAULT_HORIZONS_MIN = [120, 480, 720]  # +2h, +8h, +12h
 
+PUBLISH_PREC = 5
+
 SAFE_TBL_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 # --------------------------------------------------------------------------- #
@@ -627,7 +629,13 @@ def horizon_steps(minutes_ahead: int, interval_min: int) -> int:
 
 def horizon_agg(yhat_interval: Sequence[float], interval_min: int, minutes_ahead: int) -> float:
     steps = min(horizon_steps(minutes_ahead, interval_min), len(yhat_interval))
-    return float(np.nansum(yhat_interval[:steps]))
+    if steps <= 0:
+        logger.warning("horizon_agg: zero steps for horizon %s", minutes_ahead)
+        return 0.0
+    result = float(np.nansum(yhat_interval[:steps]))
+    if result < 1e-6:
+        logger.debug("horizon_agg %s -> %.6f", minutes_ahead, result)
+    return result
 
 
 def make_entity_name(prefix: str, base: str, suffix: Optional[str] = None) -> str:
@@ -645,7 +653,7 @@ def make_entity_name(prefix: str, base: str, suffix: Optional[str] = None) -> st
 
 def dict_from_series(index: Sequence[datetime], values: Sequence[float], tz: timezone) -> Dict[str, float]:
     return {
-        ensure_utc(ts).astimezone(tz).strftime(TIME_FORMAT_HA): round(float(v), 3)
+        ensure_utc(ts).astimezone(tz).strftime(TIME_FORMAT_HA): round(float(v), PUBLISH_PREC)
         for ts, v in zip(index, values)
     }
 
@@ -660,7 +668,7 @@ def daily_cumulative_series(index: Sequence[datetime], values: Sequence[float], 
             cum = 0.0
             current_day = lts.date()
         cum += max(float(v), 0.0)
-        out[lts.strftime(TIME_FORMAT_HA)] = round(cum, 3)
+        out[lts.strftime(TIME_FORMAT_HA)] = round(cum, PUBLISH_PREC)
     return out
 
 
@@ -686,8 +694,22 @@ async def publish_forecasts(sensor: SensorCfg,
     cum_from_now = np.cumsum(yhat_interval)
     daily_cum = daily_cumulative_series(ds_future, yhat_interval, tz)
 
-    ser_interval = dict_from_series(ds_future, yhat_interval, tz)
-    ser_cum = dict_from_series(ds_future, cum_from_now, tz)
+    publish_units = sensor.output_units or sensor.units
+    units_lower = (sensor.units or "").lower()
+    pub_lower = (publish_units or "").lower()
+    scale = 1000.0 if pub_lower == "wh" and units_lower != "wh" else 1.0
+
+    if logger.isEnabledFor(logging.DEBUG):
+        preview = yhat_interval[:10].tolist()
+        horizon_vals = {
+            m: horizon_agg(yhat_interval, cfg.common_interval, m) for m in cfg.horizons
+        }
+        logger.debug("Interval preview %s", preview)
+        logger.debug("Horizon sums %s", horizon_vals)
+
+    ser_interval = dict_from_series(ds_future, yhat_interval * scale, tz)
+    ser_cum = dict_from_series(ds_future, cum_from_now * scale, tz)
+    daily_cum = {k: v * scale for k, v in daily_cum.items()}
 
     model_ts_iso = datetime.now(timezone.utc).astimezone(tz).isoformat()
     meta = {
@@ -697,13 +719,11 @@ async def publish_forecasts(sensor: SensorCfg,
         "mae_recent": metrics.get("mae_recent") if metrics else None,
     }
 
-    publish_units = sensor.output_units or sensor.units
-
     if sensor.publish_interval:
         ent_interval = make_entity_name(prefix, sensor.name, "interval")
         await iface.set_state(
             ent_interval,
-            state=round(float(yhat_interval[0]) if len(yhat_interval) else 0.0, 3),
+            state=round(float(yhat_interval[0] * scale) if len(yhat_interval) else 0.0, PUBLISH_PREC),
             attributes={
                 "unit_of_measurement": publish_units,
                 "state_class": "measurement",
@@ -716,7 +736,7 @@ async def publish_forecasts(sensor: SensorCfg,
         ent_cum = make_entity_name(prefix, sensor.name, "cum")
         await iface.set_state(
             ent_cum,
-            state=round(float(cum_from_now[-1]) if len(cum_from_now) else 0.0, 3),
+            state=round(float(cum_from_now[-1] * scale) if len(cum_from_now) else 0.0, PUBLISH_PREC),
             attributes={
                 "unit_of_measurement": publish_units,
                 "state_class": "measurement",
@@ -732,7 +752,7 @@ async def publish_forecasts(sensor: SensorCfg,
         state_val = list(todays.values())[-1] if todays else list(daily_cum.values())[-1]
         await iface.set_state(
             ent_daily,
-            state=round(float(state_val), 3),
+            state=round(float(state_val), PUBLISH_PREC),
             attributes={
                 "unit_of_measurement": publish_units,
                 "state_class": "measurement",
@@ -753,7 +773,7 @@ async def publish_forecasts(sensor: SensorCfg,
             val = horizon_agg(yhat_interval, cfg.common_interval, m)
         await iface.set_state(
             ent_h,
-            state=round(float(val), 3),
+            state=round(float(val * scale), PUBLISH_PREC),
             attributes={
                 "unit_of_measurement": publish_units,
                 "state_class": "measurement",
@@ -789,6 +809,8 @@ async def run_sensor_job(sensor: SensorCfg,
     raw_hist, st, en = await iface.get_history(sensor.name, start_hist, end_hist)
     df = normalise_history(raw_hist)
 
+    ha_unit = await iface.get_state(sensor.name, attribute="unit_of_measurement")
+
     # DB merge
     if sensor.database and db:
         tname = sensor.name.replace(".", "_")
@@ -803,6 +825,28 @@ async def run_sensor_job(sensor: SensorCfg,
             prev = prev.rename(columns={"y": "value"})
             df = prev
 
+    if ha_unit:
+        sensor_unit = (sensor.units or "").lower()
+        ha_unit_l = str(ha_unit).lower()
+        if ha_unit_l != sensor_unit:
+            if ha_unit_l == "wh" and sensor_unit == "kwh":
+                df["value"] = df["value"] / 1000.0
+                logger.info(
+                    "Sensor %s: converted history from Wh to kWh", sensor.name
+                )
+            elif ha_unit_l == "kwh" and sensor_unit == "wh":
+                df["value"] = df["value"] * 1000.0
+                logger.info(
+                    "Sensor %s: converted history from kWh to Wh", sensor.name
+                )
+            else:
+                logger.warning(
+                    "Sensor %s: unit mismatch (%s vs %s)",
+                    sensor.name,
+                    ha_unit,
+                    sensor.units,
+                )
+
     if df.empty:
         logger.warning("Sensor %s: no data; skipping.", sensor.name)
         return
@@ -814,7 +858,7 @@ async def run_sensor_job(sensor: SensorCfg,
     # Power->energy (heuristic)
     if (not sensor.source_is_cumulative) and sensor.train_target == "interval":
         units_lower = (sensor.units or "").lower()
-        if "w" in units_lower:  # W or kW
+        if "w" in units_lower and "wh" not in units_lower:
             if df["value"].max() > 50:  # assume W
                 df["value"] = df["value"] / 1000.0
             df["value"] = df["value"] * (interval_min / 60.0)  # kWh per bucket
