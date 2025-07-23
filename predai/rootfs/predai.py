@@ -695,7 +695,10 @@ async def publish_forecasts(sensor: SensorCfg,
     daily_cum = daily_cumulative_series(ds_future, yhat_interval, tz)
 
     publish_units = sensor.output_units or sensor.units
-    scale = 1000.0 if (publish_units or "").lower() == "wh" else 1.0
+    units_lower = (sensor.units or "").lower()
+    pub_lower = (publish_units or "").lower()
+    scale = 1000.0 if pub_lower == "wh" and units_lower != "wh" else 1.0
+
 
     if logger.isEnabledFor(logging.DEBUG):
         preview = yhat_interval[:10].tolist()
