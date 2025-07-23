@@ -5,7 +5,7 @@ PredAI (fork) — config‑driven multi‑horizon forecasting for Home Assistant
 Key features:
 * Configurable sensor roles (energy counters, temperature, Mixergy immersion demand, etc.).
 * Automatic power→energy integration for non‑cumulative power sensors (mean power -> kWh/interval).
-* Covariate alias + scaling from YAML `covariates:` section.
+* Covariate alias + scaling from YAML covariates: section.
 * Interval, cumulative, daily_cum, and horizon (+2h/+8h/+12h or custom) forecast publishing.
 * Async Home Assistant API via aiohttp.
 * SQLite history cache.
@@ -58,8 +58,6 @@ DEFAULT_DB_PATH = "/config/predai.db"
 DEFAULT_PUBLISH_PREFIX = "predai_"
 DEFAULT_INTERVAL_MIN = 30
 DEFAULT_HORIZONS_MIN = [120, 480, 720]  # +2h, +8h, +12h
-
-PUBLISH_PREC = 5
 
 SAFE_TBL_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
@@ -414,11 +412,11 @@ class HistoryDB:
         t = self.safe_name(table)
         self.create_table(t)
         # Normalise previously stored timestamps to the same ISO format that we
-        # use when inserting new rows. ``str(dt)`` would produce a space between
-        # date and time ("YYYY-MM-DD HH:MM:SS+00:00"), whereas ``isoformat()``
+        # use when inserting new rows. `str(dt) would produce a space between
+        # date and time ("YYYY-MM-DD HH:MM:SS+00:00"), whereas `isoformat()
         # yields "YYYY-MM-DDTHH:MM:SS+00:00".  The mismatch allowed duplicates to
         # slip past the "timestamp_s not in prev_values" check and triggered
-        # SQLite UNIQUE constraint errors.  Build the set using ``isoformat`` so
+        # SQLite UNIQUE constraint errors.  Build the set using `isoformat so
         # comparisons are consistent.
         prev_values = set(dt.isoformat() for dt in prev["ds"] if pd.notna(dt))
         added = 0
@@ -429,17 +427,10 @@ class HistoryDB:
             timestamp_s = timestamp.isoformat()
             value = float(row["y"])
             if timestamp_s not in prev_values:
-                # Use INSERT OR IGNORE as an additional safeguard against
-                # timestamp collisions which would otherwise trigger a
-                # UNIQUE constraint error.
-                self.cur.execute(
-                    f"INSERT OR IGNORE INTO {t} (timestamp, value) VALUES (?, ?)",
-                    (timestamp_s, value),
-                )
-                if self.cur.rowcount:
-                    prev_values.add(timestamp_s)
-                    prev.loc[len(prev)] = {"ds": timestamp, "y": value}
-                    added += 1
+                self.cur.execute(f"INSERT INTO {t} (timestamp, value) VALUES (?, ?)", (timestamp_s, value))
+                prev_values.add(timestamp_s)
+                prev.loc[len(prev)] = {"ds": timestamp, "y": value}
+                added += 1
         self.con.commit()
         logger.info("DB: added %s rows to %s", added, t)
         return prev
@@ -540,9 +531,6 @@ class CovariateResolver:
                 "scale": val.get("scale", 1.0),
                 "attr": val.get("attr"),
                 "forecast_attr": val.get("forecast_attr"),
-                "aggregation": val.get("aggregation"),
-                "transform": val.get("transform"),
-                "standardise": val.get("standardise", False),
             }
         return {"entity": str(val), "scale": 1.0}
 
@@ -550,24 +538,18 @@ class CovariateResolver:
         meta = self._resolve(cov_name)
         entity_id = meta["entity"]
         raw, _, _ = await self.iface.get_history(entity_id, start, end)
-        if meta.get("attr"):
-            for rec in raw:
-                val = rec.get("attributes", {}).get(meta["attr"])
-                if val is not None:
-                    rec["state"] = val
         df = normalise_history(raw)
         if df.empty:
             return pd.Series([], dtype=float)
-        cov_agg = meta.get("aggregation", "mean" if how == "sum" else how)
-        df = resample_sensor(df, freq, cov_agg)
+        # never sum temps/% etc.; if how=='sum' use mean
+        df = resample_sensor(df, freq, "mean" if how == "sum" else how)
         df["value"] = df["value"] * meta.get("scale", 1.0)
         return df.set_index("ds")["value"]
 
     async def get_future_series(self, cov_name: str, future_index: pd.DatetimeIndex, default: float = 0.0) -> pd.Series:
         meta = self._resolve(cov_name)
         entity_id = meta["entity"]
-        attr = meta.get("forecast_attr") or meta.get("attr")
-        val = await self.iface.get_state(entity_id, attribute=attr)
+        val = await self.iface.get_state(entity_id)
         try:
             v = float(val) * meta.get("scale", 1.0)
         except (TypeError, ValueError):
@@ -629,17 +611,11 @@ def horizon_steps(minutes_ahead: int, interval_min: int) -> int:
 
 def horizon_agg(yhat_interval: Sequence[float], interval_min: int, minutes_ahead: int) -> float:
     steps = min(horizon_steps(minutes_ahead, interval_min), len(yhat_interval))
-    if steps <= 0:
-        logger.warning("horizon_agg: zero steps for horizon %s", minutes_ahead)
-        return 0.0
-    result = float(np.nansum(yhat_interval[:steps]))
-    if result < 1e-6:
-        logger.debug("horizon_agg %s -> %.6f", minutes_ahead, result)
-    return result
+    return float(np.nansum(yhat_interval[:steps]))
 
 
 def make_entity_name(prefix: str, base: str, suffix: Optional[str] = None) -> str:
-    """Return a valid Home Assistant ``entity_id`` for publishing state."""
+    """Return a valid Home Assistant `entity_id for publishing state."""
     prefix = re.sub(r"^sensor[._]", "", prefix, flags=re.IGNORECASE)
     prefix = re.sub(r"[^a-z0-9_]+", "_", prefix.lower())
     base = re.sub(r"[^a-z0-9_]+", "_", base.lower())
@@ -653,7 +629,7 @@ def make_entity_name(prefix: str, base: str, suffix: Optional[str] = None) -> st
 
 def dict_from_series(index: Sequence[datetime], values: Sequence[float], tz: timezone) -> Dict[str, float]:
     return {
-        ensure_utc(ts).astimezone(tz).strftime(TIME_FORMAT_HA): round(float(v), PUBLISH_PREC)
+        ensure_utc(ts).astimezone(tz).strftime(TIME_FORMAT_HA): round(float(v), 3)
         for ts, v in zip(index, values)
     }
 
@@ -668,7 +644,7 @@ def daily_cumulative_series(index: Sequence[datetime], values: Sequence[float], 
             cum = 0.0
             current_day = lts.date()
         cum += max(float(v), 0.0)
-        out[lts.strftime(TIME_FORMAT_HA)] = round(cum, PUBLISH_PREC)
+        out[lts.strftime(TIME_FORMAT_HA)] = round(cum, 3)
     return out
 
 
@@ -684,33 +660,13 @@ async def publish_forecasts(sensor: SensorCfg,
     prefix = cfg.publish_prefix
 
     yhat_interval = np.array(yhat_interval, dtype=float)
-    yhat_interval = np.nan_to_num(yhat_interval, nan=0.0, posinf=0.0, neginf=0.0)
     yhat_interval = np.clip(yhat_interval, 0, None)  # no negatives
-
-    if yhat_level is not None:
-        yhat_level = np.array(yhat_level, dtype=float)
-        yhat_level = np.nan_to_num(yhat_level, nan=0.0, posinf=0.0, neginf=0.0)
 
     cum_from_now = np.cumsum(yhat_interval)
     daily_cum = daily_cumulative_series(ds_future, yhat_interval, tz)
 
-    publish_units = sensor.output_units or sensor.units
-    units_lower = (sensor.units or "").lower()
-    pub_lower = (publish_units or "").lower()
-    scale = 1000.0 if pub_lower == "wh" and units_lower != "wh" else 1.0
-
-
-    if logger.isEnabledFor(logging.DEBUG):
-        preview = yhat_interval[:10].tolist()
-        horizon_vals = {
-            m: horizon_agg(yhat_interval, cfg.common_interval, m) for m in cfg.horizons
-        }
-        logger.debug("Interval preview %s", preview)
-        logger.debug("Horizon sums %s", horizon_vals)
-
-    ser_interval = dict_from_series(ds_future, yhat_interval * scale, tz)
-    ser_cum = dict_from_series(ds_future, cum_from_now * scale, tz)
-    daily_cum = {k: v * scale for k, v in daily_cum.items()}
+    ser_interval = dict_from_series(ds_future, yhat_interval, tz)
+    ser_cum = dict_from_series(ds_future, cum_from_now, tz)
 
     model_ts_iso = datetime.now(timezone.utc).astimezone(tz).isoformat()
     meta = {
@@ -720,11 +676,13 @@ async def publish_forecasts(sensor: SensorCfg,
         "mae_recent": metrics.get("mae_recent") if metrics else None,
     }
 
+    publish_units = sensor.output_units or sensor.units
+
     if sensor.publish_interval:
         ent_interval = make_entity_name(prefix, sensor.name, "interval")
         await iface.set_state(
             ent_interval,
-            state=round(float(yhat_interval[0] * scale) if len(yhat_interval) else 0.0, PUBLISH_PREC),
+            state=round(float(yhat_interval[0]) if len(yhat_interval) else 0.0, 3),
             attributes={
                 "unit_of_measurement": publish_units,
                 "state_class": "measurement",
@@ -737,7 +695,7 @@ async def publish_forecasts(sensor: SensorCfg,
         ent_cum = make_entity_name(prefix, sensor.name, "cum")
         await iface.set_state(
             ent_cum,
-            state=round(float(cum_from_now[-1] * scale) if len(cum_from_now) else 0.0, PUBLISH_PREC),
+            state=round(float(cum_from_now[-1]) if len(cum_from_now) else 0.0, 3),
             attributes={
                 "unit_of_measurement": publish_units,
                 "state_class": "measurement",
@@ -753,7 +711,7 @@ async def publish_forecasts(sensor: SensorCfg,
         state_val = list(todays.values())[-1] if todays else list(daily_cum.values())[-1]
         await iface.set_state(
             ent_daily,
-            state=round(float(state_val), PUBLISH_PREC),
+            state=round(float(state_val), 3),
             attributes={
                 "unit_of_measurement": publish_units,
                 "state_class": "measurement",
@@ -774,7 +732,7 @@ async def publish_forecasts(sensor: SensorCfg,
             val = horizon_agg(yhat_interval, cfg.common_interval, m)
         await iface.set_state(
             ent_h,
-            state=round(float(val * scale), PUBLISH_PREC),
+            state=round(float(val), 3),
             attributes={
                 "unit_of_measurement": publish_units,
                 "state_class": "measurement",
@@ -810,8 +768,6 @@ async def run_sensor_job(sensor: SensorCfg,
     raw_hist, st, en = await iface.get_history(sensor.name, start_hist, end_hist)
     df = normalise_history(raw_hist)
 
-    ha_unit = await iface.get_state(sensor.name, attribute="unit_of_measurement")
-
     # DB merge
     if sensor.database and db:
         tname = sensor.name.replace(".", "_")
@@ -826,28 +782,6 @@ async def run_sensor_job(sensor: SensorCfg,
             prev = prev.rename(columns={"y": "value"})
             df = prev
 
-    if ha_unit:
-        sensor_unit = (sensor.units or "").lower()
-        ha_unit_l = str(ha_unit).lower()
-        if ha_unit_l != sensor_unit:
-            if ha_unit_l == "wh" and sensor_unit == "kwh":
-                df["value"] = df["value"] / 1000.0
-                logger.info(
-                    "Sensor %s: converted history from Wh to kWh", sensor.name
-                )
-            elif ha_unit_l == "kwh" and sensor_unit == "wh":
-                df["value"] = df["value"] * 1000.0
-                logger.info(
-                    "Sensor %s: converted history from kWh to Wh", sensor.name
-                )
-            else:
-                logger.warning(
-                    "Sensor %s: unit mismatch (%s vs %s)",
-                    sensor.name,
-                    ha_unit,
-                    sensor.units,
-                )
-
     if df.empty:
         logger.warning("Sensor %s: no data; skipping.", sensor.name)
         return
@@ -859,7 +793,7 @@ async def run_sensor_job(sensor: SensorCfg,
     # Power->energy (heuristic)
     if (not sensor.source_is_cumulative) and sensor.train_target == "interval":
         units_lower = (sensor.units or "").lower()
-        if "w" in units_lower and "wh" not in units_lower:
+        if "w" in units_lower:  # W or kW
             if df["value"].max() > 50:  # assume W
                 df["value"] = df["value"] / 1000.0
             df["value"] = df["value"] * (interval_min / 60.0)  # kWh per bucket
@@ -917,23 +851,6 @@ async def run_sensor_job(sensor: SensorCfg,
                 train_df[cov] = np.nan
             backend.add_future_regressor(cov, mode="additive")
 
-        # Clean & transform covariates
-        scalers = {}
-        for cov in sensor.covariates_lagged + sensor.covariates_future:
-            if cov in train_df.columns:
-                train_df[cov] = train_df[cov].ffill().bfill().fillna(0.0)
-                meta = cov_res._resolve(cov)
-                if meta.get("transform") == "log1p":
-                    train_df[cov] = np.log1p(train_df[cov].clip(lower=0))
-                    scalers[cov] = ("log1p", None, None)
-                elif meta.get("standardise"):
-                    m = train_df[cov].mean()
-                    s = train_df[cov].std()
-                    train_df[cov] = (train_df[cov] - m) / (s or 1.0)
-                    scalers[cov] = ("standardise", m, s or 1.0)
-
-        assert not train_df.isna().any().any(), "Training frame contains NaNs"
-
         # Fit
         backend.fit(train_df, freq=freq)
 
@@ -944,25 +861,8 @@ async def run_sensor_job(sensor: SensorCfg,
         if fut_mask.any():
             fut_idx = pd.to_datetime(df_future.loc[fut_mask, "ds"], utc=True)
             for cov in sensor.covariates_future:
-                default_val = train_df[cov].iloc[-1] if cov in train_df else 0.0
-                fut_s = await cov_res.get_future_series(cov, fut_idx, default=default_val)
+                fut_s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
                 df_future.loc[fut_mask, cov] = fut_s.to_numpy()
-
-        # Ensure future covariates have no NaNs
-        missing = [c for c in sensor.covariates_future if df_future.get(c) is not None and df_future[c].isna().any()]
-        if missing:
-            logger.warning("Future covariate(s) %s contain NaNs. Filling.", missing)
-            for c in missing:
-                df_future[c] = df_future[c].ffill().bfill().fillna(0.0)
-
-        # Apply covariate transforms to future frame
-        for cov, params in scalers.items():
-            if cov in df_future.columns:
-                kind, m, s = params
-                if kind == "log1p":
-                    df_future[cov] = np.log1p(df_future[cov].clip(lower=0))
-                elif kind == "standardise":
-                    df_future[cov] = (df_future[cov] - m) / (s or 1.0)
 
         # Predict
         fcst = backend.predict(df_future)
