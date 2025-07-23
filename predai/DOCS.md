@@ -61,7 +61,9 @@ sensors:
   - **max_increment** - Defines the maximum increase or decrease an incrementing sensor can have before its considered a spike and ignored
   - **reset_daily** - When true the sensor value is reset to 0 at midnight (e.g. energy per day)
   - **interval** - Sets the prediction inverval, should divide into 60 e.g. 5, 10 , 15 , 30
-  - **Units** - Sets the output Unit to report in HA
+  - **Units** - Sets the unit the model operates in and publishes to Home Assistant.  PredAI will
+    automatically convert between `Wh` and `kWh` if the sensor's actual
+    `unit_of_measurement` differs from this value.
   - **future_periods** - Sets the number of periods (of interval minutes) to predict into the future, 100 is recommended for Predbat use to cover 48 hours + time until the next PredAI run.
   - **database** - When True (default) all data is stored in a sqllite3 database in the addon directory, this will keep a full history beyond what HA keeps and use
 that history for training. You can browse the data using an SQL Lite viewer on your computer.

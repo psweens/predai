@@ -807,6 +807,8 @@ async def run_sensor_job(sensor: SensorCfg,
     raw_hist, st, en = await iface.get_history(sensor.name, start_hist, end_hist)
     df = normalise_history(raw_hist)
 
+    ha_unit = await iface.get_state(sensor.name, attribute="unit_of_measurement")
+
     # DB merge
     if sensor.database and db:
         tname = sensor.name.replace(".", "_")
@@ -820,6 +822,28 @@ async def run_sensor_job(sensor: SensorCfg,
             prev = prev.sort_values("ds")
             prev = prev.rename(columns={"y": "value"})
             df = prev
+
+    if ha_unit:
+        sensor_unit = (sensor.units or "").lower()
+        ha_unit_l = str(ha_unit).lower()
+        if ha_unit_l != sensor_unit:
+            if ha_unit_l == "wh" and sensor_unit == "kwh":
+                df["value"] = df["value"] / 1000.0
+                logger.info(
+                    "Sensor %s: converted history from Wh to kWh", sensor.name
+                )
+            elif ha_unit_l == "kwh" and sensor_unit == "wh":
+                df["value"] = df["value"] * 1000.0
+                logger.info(
+                    "Sensor %s: converted history from kWh to Wh", sensor.name
+                )
+            else:
+                logger.warning(
+                    "Sensor %s: unit mismatch (%s vs %s)",
+                    sensor.name,
+                    ha_unit,
+                    sensor.units,
+                )
 
     if df.empty:
         logger.warning("Sensor %s: no data; skipping.", sensor.name)
