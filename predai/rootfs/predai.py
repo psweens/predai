@@ -941,14 +941,23 @@ async def predai_main():
             logger.info("PredAI sleeping %s minutes.", cfg.update_every)
             # Sleep minute chunks; break early if heartbeat lost. Output a
             # progress log each minute so hosting platforms don't kill the
-            # process for lack of output.
+            # process for lack of output. Log once before the first sleep so
+            # there is never a full minute with no output.
+            logger.info(
+                "PredAI sleep progress: 0/%s minutes",
+                cfg.update_every,
+            )
             for i in range(cfg.update_every):
                 await asyncio.sleep(60)
                 last_run = await iface.get_state("sensor.predai_last_run")
                 if last_run is None:
                     logger.warning("PredAI heartbeat lost; restarting early.")
                     break
-                logger.info("PredAI sleep progress: %s/%s minutes", i + 1, cfg.update_every)
+                logger.info(
+                    "PredAI sleep progress: %s/%s minutes",
+                    i + 1,
+                    cfg.update_every,
+                )
 
     finally:
         await iface.close()
