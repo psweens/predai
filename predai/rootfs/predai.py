@@ -699,6 +699,7 @@ async def publish_forecasts(sensor: SensorCfg,
     pub_lower = (publish_units or "").lower()
     scale = 1000.0 if pub_lower == "wh" and units_lower != "wh" else 1.0
 
+
     if logger.isEnabledFor(logging.DEBUG):
         preview = yhat_interval[:10].tolist()
         horizon_vals = {
