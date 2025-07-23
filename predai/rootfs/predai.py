@@ -531,6 +531,9 @@ class CovariateResolver:
                 "scale": val.get("scale", 1.0),
                 "attr": val.get("attr"),
                 "forecast_attr": val.get("forecast_attr"),
+                "aggregation": val.get("aggregation"),
+                "transform": val.get("transform"),
+                "standardise": val.get("standardise", False),
             }
         return {"entity": str(val), "scale": 1.0}
 
@@ -538,18 +541,24 @@ class CovariateResolver:
         meta = self._resolve(cov_name)
         entity_id = meta["entity"]
         raw, _, _ = await self.iface.get_history(entity_id, start, end)
+        if meta.get("attr"):
+            for rec in raw:
+                val = rec.get("attributes", {}).get(meta["attr"])
+                if val is not None:
+                    rec["state"] = val
         df = normalise_history(raw)
         if df.empty:
             return pd.Series([], dtype=float)
-        # never sum temps/% etc.; if how=='sum' use mean
-        df = resample_sensor(df, freq, "mean" if how == "sum" else how)
+        cov_agg = meta.get("aggregation", "mean" if how == "sum" else how)
+        df = resample_sensor(df, freq, cov_agg)
         df["value"] = df["value"] * meta.get("scale", 1.0)
         return df.set_index("ds")["value"]
 
     async def get_future_series(self, cov_name: str, future_index: pd.DatetimeIndex, default: float = 0.0) -> pd.Series:
         meta = self._resolve(cov_name)
         entity_id = meta["entity"]
-        val = await self.iface.get_state(entity_id)
+        attr = meta.get("forecast_attr") or meta.get("attr")
+        val = await self.iface.get_state(entity_id, attribute=attr)
         try:
             v = float(val) * meta.get("scale", 1.0)
         except (TypeError, ValueError):
@@ -851,6 +860,23 @@ async def run_sensor_job(sensor: SensorCfg,
                 train_df[cov] = np.nan
             backend.add_future_regressor(cov, mode="additive")
 
+        # Clean & transform covariates
+        scalers = {}
+        for cov in sensor.covariates_lagged + sensor.covariates_future:
+            if cov in train_df.columns:
+                train_df[cov] = train_df[cov].ffill().bfill().fillna(0.0)
+                meta = cov_res._resolve(cov)
+                if meta.get("transform") == "log1p":
+                    train_df[cov] = np.log1p(train_df[cov].clip(lower=0))
+                    scalers[cov] = ("log1p", None, None)
+                elif meta.get("standardise"):
+                    m = train_df[cov].mean()
+                    s = train_df[cov].std()
+                    train_df[cov] = (train_df[cov] - m) / (s or 1.0)
+                    scalers[cov] = ("standardise", m, s or 1.0)
+
+        assert not train_df.isna().any().any(), "Training frame contains NaNs"
+
         # Fit
         backend.fit(train_df, freq=freq)
 
@@ -861,8 +887,25 @@ async def run_sensor_job(sensor: SensorCfg,
         if fut_mask.any():
             fut_idx = pd.to_datetime(df_future.loc[fut_mask, "ds"], utc=True)
             for cov in sensor.covariates_future:
-                fut_s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
+                default_val = train_df[cov].iloc[-1] if cov in train_df else 0.0
+                fut_s = await cov_res.get_future_series(cov, fut_idx, default=default_val)
                 df_future.loc[fut_mask, cov] = fut_s.to_numpy()
+
+        # Ensure future covariates have no NaNs
+        missing = [c for c in sensor.covariates_future if df_future.get(c) is not None and df_future[c].isna().any()]
+        if missing:
+            logger.warning("Future covariate(s) %s contain NaNs. Filling.", missing)
+            for c in missing:
+                df_future[c] = df_future[c].ffill().bfill().fillna(0.0)
+
+        # Apply covariate transforms to future frame
+        for cov, params in scalers.items():
+            if cov in df_future.columns:
+                kind, m, s = params
+                if kind == "log1p":
+                    df_future[cov] = np.log1p(df_future[cov].clip(lower=0))
+                elif kind == "standardise":
+                    df_future[cov] = (df_future[cov] - m) / (s or 1.0)
 
         # Predict
         fcst = backend.predict(df_future)

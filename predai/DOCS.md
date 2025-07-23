@@ -71,6 +71,10 @@ that history for training. You can browse the data using an SQL Lite viewer on y
   - **country** - When set adds in the specified countries holidays (see https://python-holidays.readthedocs.io/en/latest/)
   - **covariates** - List of sensor entity_ids used as lagged regressors
   - **future_covariates** - List of sensor entity_ids that provide values for both history and future
+  - **covariate map** - Under the top level `covariates:` section you can alias
+    covariate names and set options such as `attr`, `forecast_attr` and an
+    `aggregation` override. `forecast_attr` is used when fetching future values
+    and falls back to `attr` if missing.
 
 A new sensor with the name **name**_prediction will be created, this will contain two series:
   - **results** contains the time series of the predictions, starts in the past so you can plot corrolation
