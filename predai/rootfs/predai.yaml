@@ -28,3 +28,13 @@ update_every: 30
 #    units: c
 #    future_periods: 100
 #    country: UK
+
+#covariates:
+#  outdoor_temp:
+#    entity: sensor.external_temperature
+#    attr: current
+#    forecast_attr: forecast
+#    aggregation: mean
+#    scale: 1.0
+#    transform: log1p
+#    standardise: true

@@ -12,6 +12,11 @@ See the documentation https://github.com/springfall2008/predai/blob/main/predai/
 
 For support please raise a Github ticket.
 
+Covariates defined in `predai.yaml` may map to different Home Assistant sensors
+or attributes.  Use `attr` for historical values and `forecast_attr` for the
+future lookup (falls back to `attr` when unset).  A per-covariate `aggregation`
+override is also supported.
+
 If you want to buy me a beer then please use Paypal - [tdlj@tdlj.net](mailto:tdlj@tdlj.net)
 ![image](https://github.com/springfall2008/batpred/assets/48591903/b3a533ef-0862-4e0b-b272-30e254f58467)
 
