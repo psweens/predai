@@ -427,10 +427,17 @@ class HistoryDB:
             timestamp_s = timestamp.isoformat()
             value = float(row["y"])
             if timestamp_s not in prev_values:
-                self.cur.execute(f"INSERT INTO {t} (timestamp, value) VALUES (?, ?)", (timestamp_s, value))
-                prev_values.add(timestamp_s)
-                prev.loc[len(prev)] = {"ds": timestamp, "y": value}
-                added += 1
+                # Use INSERT OR IGNORE as an additional safeguard against
+                # timestamp collisions which would otherwise trigger a
+                # UNIQUE constraint error.
+                self.cur.execute(
+                    f"INSERT OR IGNORE INTO {t} (timestamp, value) VALUES (?, ?)",
+                    (timestamp_s, value),
+                )
+                if self.cur.rowcount:
+                    prev_values.add(timestamp_s)
+                    prev.loc[len(prev)] = {"ds": timestamp, "y": value}
+                    added += 1
         self.con.commit()
         logger.info("DB: added %s rows to %s", added, t)
         return prev
