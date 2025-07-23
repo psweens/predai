@@ -664,7 +664,12 @@ async def publish_forecasts(sensor: SensorCfg,
     prefix = cfg.publish_prefix
 
     yhat_interval = np.array(yhat_interval, dtype=float)
+    yhat_interval = np.nan_to_num(yhat_interval, nan=0.0, posinf=0.0, neginf=0.0)
     yhat_interval = np.clip(yhat_interval, 0, None)  # no negatives
+
+    if yhat_level is not None:
+        yhat_level = np.array(yhat_level, dtype=float)
+        yhat_level = np.nan_to_num(yhat_level, nan=0.0, posinf=0.0, neginf=0.0)
 
     cum_from_now = np.cumsum(yhat_interval)
     daily_cum = daily_cumulative_series(ds_future, yhat_interval, tz)
