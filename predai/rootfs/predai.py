@@ -948,63 +948,36 @@ async def run_sensor_job(sensor: SensorCfg,
         backend.fit(train_df, freq=freq)
         logger.info("Sensor %s: model trained", sensor.name)
 
-        # Future frame
-        # NeuralProphet requires future regressor values to be present when
-        # generating the prediction DataFrame. Create placeholder rows so that
-        # make_future() succeeds, then overwrite them with real values.
+        # ------------------------------------------------------------------
+        # Future frame + prediction  ✱ FIX for issue (1)
+        # ------------------------------------------------------------------
+        steps = max(horizon_steps(m, interval_min) for m in cfg.horizons)
+
+        # 1.  Let NeuralProphet extend the history itself.
         last_ts = train_df["ds"].max()
-        fut_idx = [last_ts + timedelta(minutes=interval_min * i) for i in range(1, steps + 1)]
-        extra_rows = pd.DataFrame({"ds": fut_idx})
-        for cov in sensor.covariates_future:
-            extra_rows[cov] = 0.0  # placeholder, replaced below
-        for cov in sensor.covariates_lagged:
-            # ``make_future_dataframe`` also checks lagged regressors for NaN at
-            # the tail of the DataFrame.  Populate them with the most recent
-            # known value so the extended rows are fully defined.
-            last_val = train_df[cov].iloc[-1]
-            extra_rows[cov] = last_val if not pd.isna(last_val) else 0.0
-        # ``make_future_dataframe`` complains if the last rows contain NaN. Use
-        # the last observed ``y`` so the tail of the DataFrame is fully
-        # populated.
-        extra_rows["y"] = train_df["y"].iloc[-1]
-
-
-        df_make_future = pd.concat([train_df, extra_rows], ignore_index=True, sort=False)
-        # fill any remaining missing values so make_future_dataframe does not fail
-        df_make_future = df_make_future.fillna(method="ffill").fillna(0.0)
-
-        # ``df_make_future`` already contains rows for the desired forecast
-        # horizon. Pass ``periods=0`` so NeuralProphet does not try to append
-        # additional rows without regressor values which would trigger a
-        # ``Future values of all user specified regressors not provided`` error.
-        df_future = backend.make_future(df_make_future, periods=0)
+        df_future = backend.make_future(train_df, periods=steps)
         df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
-        fut_mask = df_future["ds"] > last_ts
-        if fut_mask.any():
-            fut_idx = pd.to_datetime(df_future.loc[fut_mask, "ds"], utc=True)
+
+        # 2.  Supply values for FUTURE regressors (only rows where ds > last_ts).
+        if sensor.covariates_future:
+            fut_mask = df_future["ds"] > last_ts
+            fut_idx: pd.DatetimeIndex = df_future.loc[fut_mask, "ds"]
+
             for cov in sensor.covariates_future:
-                fut_s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
-                df_future.loc[fut_mask, cov] = fut_s.to_numpy()
-                logger.debug(
-                    "Covariate %s: future values inserted rows=%s", cov, len(fut_s)
-                )
+                fut_values = await cov_res.get_future_series(cov, fut_idx, default=0.0)
+                df_future.loc[fut_mask, cov] = fut_values.to_numpy()
 
-        # Predict
+        # 3.  Predict.
         fcst = backend.predict(df_future)
-        logger.debug(
-            "Sensor %s: prediction head=%s", sensor.name, fcst.head().to_dict()
-        )
 
-        # Extract forecast row corresponding to last training timestamp
-        base = train_df["ds"].max()
-        row_mask = fcst["ds"] == base
-        if not row_mask.any():  # fallback: last row
-            row_mask = fcst.index == (len(fcst) - 1)
-        yhat_cols = [f"yhat{i}" for i in range(1, steps + 1)]
-        yhat_int = fcst.loc[row_mask, yhat_cols].values.flatten()
-        logger.info(
-            "Sensor %s: produced %s forecast steps", sensor.name, len(yhat_int)
+        # 4.  Grab the first *true‑future* row and collect yhat₁ … yhatₙ.
+        first_future = fcst[fcst["ds"] > last_ts].iloc[0]
+        yhat_cols = sorted(
+            [c for c in first_future.index if c.startswith("yhat")],
+            key=lambda s: int(s[4:]),
         )
+        yhat_int = first_future[yhat_cols].to_numpy()
+
 
         if log_applied:
             yhat_int = invert_log_transform(yhat_int, True)
