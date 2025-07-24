@@ -983,7 +983,8 @@ async def run_sensor_job(sensor: SensorCfg,
         if log_applied:
             yhat_int = invert_log_transform(yhat_int, True)
 
-        ds_future = [pd.to_datetime(base) + timedelta(minutes=interval_min * i) for i in range(1, steps + 1)]
+        ds_future = [last_ts + timedelta(minutes=interval_min * i)
+                     for i in range(1, steps + 1)]
 
         metrics = {"training_rows": int(len(train_df)), "mae_recent": None}
         await publish_forecasts(sensor, role_cfg, iface, cfg, ds_future, yhat_int, metrics=metrics)
