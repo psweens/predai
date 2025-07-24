@@ -959,14 +959,15 @@ async def run_sensor_job(sensor: SensorCfg,
             extra_rows[cov] = 0.0  # placeholder, replaced below
         for cov in sensor.covariates_lagged:
             # ``make_future_dataframe`` also checks lagged regressors for NaN at
-            # the tail of the DataFrame.  Populate them with a dummy value so
-            # the extended rows are fully defined.
-            extra_rows[cov] = 0.0
+            # the tail of the DataFrame.  Populate them with the most recent
+            # known value so the extended rows are fully defined.
+            last_val = train_df[cov].iloc[-1]
+            extra_rows[cov] = last_val if not pd.isna(last_val) else 0.0
+        # ``make_future_dataframe`` complains if the last rows contain NaN. Use
+        # the last observed ``y`` so the tail of the DataFrame is fully
+        # populated.
+        extra_rows["y"] = train_df["y"].iloc[-1]
 
-        # ``make_future_dataframe`` complains if the last rows contain NaN.
-        # Provide a dummy "y" value for the placeholder rows so the tail of the
-        # DataFrame is fully populated.
-        extra_rows["y"] = 0.0
         df_make_future = pd.concat([train_df, extra_rows], ignore_index=True, sort=False)
 
         # ``df_make_future`` already contains rows for the desired forecast
