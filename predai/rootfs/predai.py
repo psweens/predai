@@ -967,6 +967,7 @@ async def run_sensor_job(sensor: SensorCfg,
         # the last observed ``y`` so the tail of the DataFrame is fully
         # populated.
         extra_rows["y"] = train_df["y"].iloc[-1]
+
         df_make_future = pd.concat([train_df, extra_rows], ignore_index=True, sort=False)
 
         # ``df_make_future`` already contains rows for the desired forecast
