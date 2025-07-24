@@ -994,12 +994,18 @@ async def run_sensor_job(sensor: SensorCfg,
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
 
         # 6.  Take the first *true‑future* row and collect yhat₁ … yhatₙ.
-        first_future = fcst[fcst["ds"] > last_ts].iloc[0]
-        yhat_cols = sorted([c for c in first_future.index if c.startswith("yhat")],
-                           key=lambda s: int(s[4:]))
-        yhat_int = first_future[yhat_cols].to_numpy()
+        # Extract the forecast vector from the *last* historic row
+        row_mask = fcst["ds"] == last_ts
+        if not row_mask.any():              # fallback: last row of frame
+            row_mask = fcst.index == (len(fcst) - 1)
 
+        last_row = fcst.loc[row_mask].iloc[0]
 
+        yhat_cols = sorted(
+            [c for c in last_row.index if c.startswith("yhat")],
+            key=lambda s: int(s[4:]),
+        )
+        yhat_int = last_row[yhat_cols].to_numpy()
 
         if log_applied:
             yhat_int = invert_log_transform(yhat_int, True)
