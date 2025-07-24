@@ -968,7 +968,10 @@ async def run_sensor_job(sensor: SensorCfg,
         # populated.
         extra_rows["y"] = train_df["y"].iloc[-1]
 
+
         df_make_future = pd.concat([train_df, extra_rows], ignore_index=True, sort=False)
+        # fill any remaining missing values so make_future_dataframe does not fail
+        df_make_future = df_make_future.fillna(method="ffill").fillna(0.0)
 
         # ``df_make_future`` already contains rows for the desired forecast
         # horizon. Pass ``periods=0`` so NeuralProphet does not try to append
