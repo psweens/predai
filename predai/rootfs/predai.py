@@ -953,7 +953,11 @@ async def run_sensor_job(sensor: SensorCfg,
             extra_rows[cov] = 0.0  # placeholder, replaced below
         df_make_future = pd.concat([train_df, extra_rows], ignore_index=True, sort=False)
 
-        df_future = backend.make_future(df_make_future, periods=steps)
+        # ``df_make_future`` already contains rows for the desired forecast
+        # horizon. Pass ``periods=0`` so NeuralProphet does not try to append
+        # additional rows without regressor values which would trigger a
+        # ``Future values of all user specified regressors not provided`` error.
+        df_future = backend.make_future(df_make_future, periods=0)
         df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
         fut_mask = df_future["ds"] > last_ts
         if fut_mask.any():
