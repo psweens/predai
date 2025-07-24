@@ -938,6 +938,12 @@ async def run_sensor_job(sensor: SensorCfg,
                 logger.debug("Covariate %s future: no history, filled NaN", cov)
             backend.add_future_regressor(cov, mode="additive")
 
+        # ensure no NaN values at the end of the training data
+        cov_cols = sensor.covariates_lagged + sensor.covariates_future
+        if cov_cols:
+            train_df[cov_cols] = train_df[cov_cols].fillna(method="ffill")
+            train_df[cov_cols] = train_df[cov_cols].fillna(0.0)
+
         # Fit
         backend.fit(train_df, freq=freq)
         logger.info("Sensor %s: model trained", sensor.name)
