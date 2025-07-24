@@ -448,18 +448,23 @@ class HistoryDB:
 # --------------------------------------------------------------------------- #
 
 def normalise_history(raw: List[dict]) -> pd.DataFrame:
+    logger.debug("Normalising history with %s raw rows", len(raw))
     if not raw:
         return pd.DataFrame(columns=["ds", "value"])
     df = pd.DataFrame(raw)
     df["ds"] = pd.to_datetime(df["last_updated"], utc=True, errors="coerce")
     df["value"] = pd.to_numeric(df["state"], errors="coerce")
     df = df.dropna(subset=["ds", "value"]).sort_values("ds")
+    logger.debug("Normalised history result rows=%s", len(df))
     return df[["ds", "value"]]
 
 
 def resample_sensor(df: pd.DataFrame, freq: str, how: str) -> pd.DataFrame:
     if df.empty:
         return df
+    logger.debug(
+        "Resampling %s rows to freq=%s how=%s", len(df), freq, how
+    )
     df = df.set_index("ds").sort_index()
     if how == "sum":
         agg = df["value"].resample(freq).sum(min_count=1)
@@ -468,34 +473,47 @@ def resample_sensor(df: pd.DataFrame, freq: str, how: str) -> pd.DataFrame:
     else:  # mean default
         agg = df["value"].resample(freq).mean()
     out = agg.to_frame("value").reset_index()
-    return out.dropna(subset=["value"])
+    out = out.dropna(subset=["value"])
+    logger.debug("Resampled result rows=%s", len(out))
+    return out
 
 
 def cumulative_to_interval(df: pd.DataFrame, reset_cfg: ResetDetectionCfg) -> pd.DataFrame:
     if df.empty:
         df["y"] = []
         return df
+    logger.debug("Cumulative->interval on %s rows", len(df))
     df = df.sort_values("ds").reset_index(drop=True)
     v = df["value"].to_numpy()
     delta = np.diff(v, prepend=v[0])
     delta[0] = np.nan
     neg_mask = delta < 0
+    reset_count = 0
     if reset_cfg.enabled:
         if reset_cfg.hard_reset_value is not None:
             reset_mask = np.isclose(v, reset_cfg.hard_reset_value)
+            reset_count = int(np.sum(reset_mask))
             for i in np.where(reset_mask)[0]:
                 delta[i] = v[i]
     delta[neg_mask] = np.nan
     delta = np.nan_to_num(delta, nan=0.0)
     delta = np.clip(delta, 0.0, None)
     df["y"] = delta
+    logger.debug(
+        "Cumulative->interval result rows=%s neg=%s resets=%s",
+        len(df),
+        int(neg_mask.sum()),
+        reset_count,
+    )
     return df
 
 
 def apply_log_transform(df: pd.DataFrame) -> pd.DataFrame:
+    logger.debug("Applying log transform to %s rows", len(df))
     df = df.copy()
     df["y"] = np.log1p(df["y"].clip(lower=0))
     df.attrs["log_transform_applied"] = True
+    logger.debug("Log transform complete")
     return df
 
 
@@ -550,14 +568,26 @@ class CovariateResolver:
         )
         raw, _, _ = await self.iface.get_history(entity_id, start, end)
         df = normalise_history(raw)
+        logger.debug(
+            "Covariate %s: normalised history rows=%s", cov_name, len(df)
+        )
         if df.empty:
             return pd.Series([], dtype=float)
         # never sum temps/% etc.; if how=='sum' use mean
         df = resample_sensor(df, freq, "mean" if how == "sum" else how)
+        logger.debug(
+            "Covariate %s: resampled rows=%s", cov_name, len(df)
+        )
         df["value"] = df["value"] * meta.get("scale", 1.0)
+        logger.debug(
+            "Covariate %s: scaled by %s", cov_name, meta.get("scale", 1.0)
+        )
         out = df.set_index("ds")["value"]
         logger.debug(
             "Covariate %s: obtained %s rows", cov_name, len(out)
+        )
+        logger.debug(
+            "Covariate %s: head=%s", cov_name, out.head().to_dict()
         )
         return out
 
@@ -571,6 +601,9 @@ class CovariateResolver:
             v = default
         logger.debug(
             "Covariate %s: future value %s from %s", cov_name, v, entity_id
+        )
+        logger.debug(
+            "Covariate %s: future series len=%s", cov_name, len(future_index)
         )
         return pd.Series(v, index=future_index)
 
@@ -885,6 +918,9 @@ async def run_sensor_job(sensor: SensorCfg,
             s = await cov_res.get_hist_series(cov, start_hist, end_hist, freq, agg)
             if not s.empty:
                 train_df = train_df.merge(s.rename(cov), left_on="ds", right_index=True, how="left")
+                logger.debug(
+                    "Covariate %s lagged: merged %s rows", cov, len(s)
+                )
                 backend.add_lagged_regressor(cov, n_lags=sensor.effective_n_lags(role_cfg))
             else:
                 logger.debug("Covariate %s lagged: no history.", cov)
@@ -894,8 +930,12 @@ async def run_sensor_job(sensor: SensorCfg,
             s = await cov_res.get_hist_series(cov, start_hist, end_hist, freq, agg)
             if not s.empty:
                 train_df = train_df.merge(s.rename(cov), left_on="ds", right_index=True, how="left")
+                logger.debug(
+                    "Covariate %s future: merged %s rows", cov, len(s)
+                )
             else:
                 train_df[cov] = np.nan
+                logger.debug("Covariate %s future: no history, filled NaN", cov)
             backend.add_future_regressor(cov, mode="additive")
 
         # Fit
@@ -911,6 +951,9 @@ async def run_sensor_job(sensor: SensorCfg,
             for cov in sensor.covariates_future:
                 fut_s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
                 df_future.loc[fut_mask, cov] = fut_s.to_numpy()
+                logger.debug(
+                    "Covariate %s: future values inserted rows=%s", cov, len(fut_s)
+                )
 
         # Predict
         fcst = backend.predict(df_future)
