@@ -541,6 +541,13 @@ class CovariateResolver:
     async def get_hist_series(self, cov_name: str, start: datetime, end: datetime, freq: str, how: str) -> pd.Series:
         meta = self._resolve(cov_name)
         entity_id = meta["entity"]
+        logger.debug(
+            "Covariate %s: fetching history for %s from %s to %s",
+            cov_name,
+            entity_id,
+            start,
+            end,
+        )
         raw, _, _ = await self.iface.get_history(entity_id, start, end)
         df = normalise_history(raw)
         if df.empty:
@@ -548,7 +555,11 @@ class CovariateResolver:
         # never sum temps/% etc.; if how=='sum' use mean
         df = resample_sensor(df, freq, "mean" if how == "sum" else how)
         df["value"] = df["value"] * meta.get("scale", 1.0)
-        return df.set_index("ds")["value"]
+        out = df.set_index("ds")["value"]
+        logger.debug(
+            "Covariate %s: obtained %s rows", cov_name, len(out)
+        )
+        return out
 
     async def get_future_series(self, cov_name: str, future_index: pd.DatetimeIndex, default: float = 0.0) -> pd.Series:
         meta = self._resolve(cov_name)
@@ -558,6 +569,9 @@ class CovariateResolver:
             v = float(val) * meta.get("scale", 1.0)
         except (TypeError, ValueError):
             v = default
+        logger.debug(
+            "Covariate %s: future value %s from %s", cov_name, v, entity_id
+        )
         return pd.Series(v, index=future_index)
 
 
@@ -660,6 +674,7 @@ async def publish_forecasts(sensor: SensorCfg,
                             yhat_interval: Sequence[float],
                             yhat_level: Optional[Sequence[float]] = None,
                             metrics: Optional[dict] = None):
+    logger.info("Publishing forecasts for %s", sensor.name)
     tz = cfg.tz
     prefix = cfg.publish_prefix
 
@@ -750,6 +765,8 @@ async def publish_forecasts(sensor: SensorCfg,
             },
         )
 
+    logger.info("Finished publishing forecasts for %s", sensor.name)
+
 
 # --------------------------------------------------------------------------- #
 # Sensor job execution
@@ -776,6 +793,13 @@ async def run_sensor_job(sensor: SensorCfg,
     logger.info("Sensor %s: fetching history %s → %s", sensor.name, start_hist, end_hist)
     raw_hist, st, en = await iface.get_history(sensor.name, start_hist, end_hist)
     df = normalise_history(raw_hist)
+    logger.info(
+        "Sensor %s: history rows=%s first=%s last=%s",
+        sensor.name,
+        len(df),
+        df["ds"].min() if not df.empty else None,
+        df["ds"].max() if not df.empty else None,
+    )
 
     # DB merge
     if sensor.database and db:
@@ -790,6 +814,9 @@ async def run_sensor_job(sensor: SensorCfg,
             prev = prev.sort_values("ds")
             prev = prev.rename(columns={"y": "value"})
             df = prev
+        logger.info(
+            "Sensor %s: dataset after DB merge rows=%s", sensor.name, len(df)
+        )
 
     if df.empty:
         logger.warning("Sensor %s: no data; skipping.", sensor.name)
@@ -798,6 +825,9 @@ async def run_sensor_job(sensor: SensorCfg,
     # Resample
     agg = sensor.effective_aggregation(role_cfg)
     df = resample_sensor(df, freq, agg)
+    logger.info(
+        "Sensor %s: after resample %s rows from %s", sensor.name, len(df), freq
+    )
 
     # Power->energy (heuristic)
     if (not sensor.source_is_cumulative) and sensor.train_target == "interval":
@@ -814,15 +844,20 @@ async def run_sensor_job(sensor: SensorCfg,
         df = cumulative_to_interval(df, sensor.reset_detection)
     else:
         df = df.rename(columns={"value": "y"})
+    logger.debug("Sensor %s: after transform rows=%s", sensor.name, len(df))
 
     # Clean
     df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0)
     df = df.dropna(subset=["y"])
+    logger.debug(
+        "Sensor %s: cleaned data rows=%s", sensor.name, len(df)
+    )
 
     log_applied = False
     if sensor.log_transform:
         df = apply_log_transform(df)
         log_applied = True
+        logger.debug("Sensor %s: applied log transform", sensor.name)
 
     if len(df) < role_cfg.n_lags + 5:
         logger.warning("Sensor %s: insufficient history (%s rows); skipping model.", sensor.name, len(df))
@@ -830,6 +865,9 @@ async def run_sensor_job(sensor: SensorCfg,
 
     # Training frame
     train_df = df[["ds", "y"]].copy()
+    logger.info(
+        "Sensor %s: training frame %s rows", sensor.name, len(train_df)
+    )
 
     if role_cfg.model_backend == "neuralprophet":
         steps = max(horizon_steps(m, interval_min) for m in cfg.horizons)
@@ -862,6 +900,7 @@ async def run_sensor_job(sensor: SensorCfg,
 
         # Fit
         backend.fit(train_df, freq=freq)
+        logger.info("Sensor %s: model trained", sensor.name)
 
         # Future frame
         df_future = backend.make_future(train_df, periods=steps)
@@ -875,6 +914,9 @@ async def run_sensor_job(sensor: SensorCfg,
 
         # Predict
         fcst = backend.predict(df_future)
+        logger.debug(
+            "Sensor %s: prediction head=%s", sensor.name, fcst.head().to_dict()
+        )
 
         # Extract forecast row corresponding to last training timestamp
         base = train_df["ds"].max()
@@ -883,6 +925,9 @@ async def run_sensor_job(sensor: SensorCfg,
             row_mask = fcst.index == (len(fcst) - 1)
         yhat_cols = [f"yhat{i}" for i in range(1, steps + 1)]
         yhat_int = fcst.loc[row_mask, yhat_cols].values.flatten()
+        logger.info(
+            "Sensor %s: produced %s forecast steps", sensor.name, len(yhat_int)
+        )
 
         if log_applied:
             yhat_int = invert_log_transform(yhat_int, True)
@@ -891,6 +936,7 @@ async def run_sensor_job(sensor: SensorCfg,
 
         metrics = {"training_rows": int(len(train_df)), "mae_recent": None}
         await publish_forecasts(sensor, role_cfg, iface, cfg, ds_future, yhat_int, metrics=metrics)
+        logger.info("Sensor %s: forecasting complete", sensor.name)
 
     else:
         logger.error("Unsupported backend %s for sensor %s", role_cfg.model_backend, sensor.name)
