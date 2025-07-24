@@ -949,35 +949,56 @@ async def run_sensor_job(sensor: SensorCfg,
         logger.info("Sensor %s: model trained", sensor.name)
 
         # ------------------------------------------------------------------
-        # Future frame + prediction  ✱ FIX for issue (1)
+        # Future frame + prediction  ✱ handles future‑regressor check
         # ------------------------------------------------------------------
         steps = max(horizon_steps(m, interval_min) for m in cfg.horizons)
 
-        # 1.  Let NeuralProphet extend the history itself.
         last_ts = train_df["ds"].max()
-        df_future = backend.make_future(train_df, periods=steps)
+
+        # 1.  Build placeholder rows for the forecast horizon so NP sees the
+        #     future‑regressor columns *before* it validates the DataFrame.
+        fut_idx = [last_ts + timedelta(minutes=interval_min * i)
+                   for i in range(1, steps + 1)]
+        extra_rows = pd.DataFrame({"ds": fut_idx})
+
+        #    • future regressors → provisional 0.0
+        for cov in sensor.covariates_future:
+            extra_rows[cov] = 0.0
+
+        #    • lagged regressors → repeat last observed value
+        for cov in sensor.covariates_lagged:
+            last_val = train_df[cov].iloc[-1] if cov in train_df.columns else 0.0
+            extra_rows[cov] = last_val if pd.notna(last_val) else 0.0
+
+        #    • target column must exist (value is ignored during prediction)
+        extra_rows["y"] = train_df["y"].iloc[-1]
+
+        # 2.  Concatenate history + placeholder future rows.
+        df_make_future = pd.concat([train_df, extra_rows], ignore_index=True)
+
+        # 3.  Tell NP *not* to append additional rows (periods=0) because we
+        #     have already supplied them.
+        df_future = backend.make_future(df_make_future, periods=0)
         df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
 
-        # 2.  Supply values for FUTURE regressors (only rows where ds > last_ts).
+        # 4.  Overwrite placeholder future‑regressor values with real ones.
         if sensor.covariates_future:
             fut_mask = df_future["ds"] > last_ts
-            fut_idx: pd.DatetimeIndex = df_future.loc[fut_mask, "ds"]
-
+            fut_idx = df_future.loc[fut_mask, "ds"]
             for cov in sensor.covariates_future:
-                fut_values = await cov_res.get_future_series(cov, fut_idx, default=0.0)
-                df_future.loc[fut_mask, cov] = fut_values.to_numpy()
+                fut_series = await cov_res.get_future_series(cov, fut_idx, default=0.0)
+                df_future.loc[fut_mask, cov] = fut_series.to_numpy()
 
-        # 3.  Predict.
+        # 5.  Predict.
         fcst = backend.predict(df_future)
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
 
-        # 4.  Grab the first *true‑future* row and collect yhat₁ … yhatₙ.
+        # 6.  Take the first *true‑future* row and collect yhat₁ … yhatₙ.
         first_future = fcst[fcst["ds"] > last_ts].iloc[0]
-        yhat_cols = sorted(
-            [c for c in first_future.index if c.startswith("yhat")],
-            key=lambda s: int(s[4:]),
-        )
+        yhat_cols = sorted([c for c in first_future.index if c.startswith("yhat")],
+                           key=lambda s: int(s[4:]))
         yhat_int = first_future[yhat_cols].to_numpy()
+
 
 
         if log_applied:
