@@ -943,9 +943,19 @@ async def run_sensor_job(sensor: SensorCfg,
         logger.info("Sensor %s: model trained", sensor.name)
 
         # Future frame
-        df_future = backend.make_future(train_df, periods=steps)
+        # NeuralProphet requires future regressor values to be present when
+        # generating the prediction DataFrame. Create placeholder rows so that
+        # make_future() succeeds, then overwrite them with real values.
+        last_ts = train_df["ds"].max()
+        fut_idx = [last_ts + timedelta(minutes=interval_min * i) for i in range(1, steps + 1)]
+        extra_rows = pd.DataFrame({"ds": fut_idx})
+        for cov in sensor.covariates_future:
+            extra_rows[cov] = 0.0  # placeholder, replaced below
+        df_make_future = pd.concat([train_df, extra_rows], ignore_index=True, sort=False)
+
+        df_future = backend.make_future(df_make_future, periods=steps)
         df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
-        fut_mask = df_future["ds"] > train_df["ds"].max()
+        fut_mask = df_future["ds"] > last_ts
         if fut_mask.any():
             fut_idx = pd.to_datetime(df_future.loc[fut_mask, "ds"], utc=True)
             for cov in sensor.covariates_future:
