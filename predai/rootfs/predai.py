@@ -71,7 +71,7 @@ if not logger.handlers:
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
     h.setFormatter(fmt)
     logger.addHandler(h)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 # --------------------------------------------------------------------------- #
 # Utility: timestamps
