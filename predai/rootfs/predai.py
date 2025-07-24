@@ -957,6 +957,10 @@ async def run_sensor_job(sensor: SensorCfg,
         extra_rows = pd.DataFrame({"ds": fut_idx})
         for cov in sensor.covariates_future:
             extra_rows[cov] = 0.0  # placeholder, replaced below
+        # ``make_future_dataframe`` complains if the last rows contain NaN.
+        # Provide a dummy "y" value for the placeholder rows so the tail of the
+        # DataFrame is fully populated.
+        extra_rows["y"] = 0.0
         df_make_future = pd.concat([train_df, extra_rows], ignore_index=True, sort=False)
 
         # ``df_make_future`` already contains rows for the desired forecast
