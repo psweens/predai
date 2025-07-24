@@ -957,6 +957,12 @@ async def run_sensor_job(sensor: SensorCfg,
         extra_rows = pd.DataFrame({"ds": fut_idx})
         for cov in sensor.covariates_future:
             extra_rows[cov] = 0.0  # placeholder, replaced below
+        for cov in sensor.covariates_lagged:
+            # ``make_future_dataframe`` also checks lagged regressors for NaN at
+            # the tail of the DataFrame.  Populate them with a dummy value so
+            # the extended rows are fully defined.
+            extra_rows[cov] = 0.0
+
         # ``make_future_dataframe`` complains if the last rows contain NaN.
         # Provide a dummy "y" value for the placeholder rows so the tail of the
         # DataFrame is fully populated.
