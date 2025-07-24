@@ -969,6 +969,7 @@ async def run_sensor_job(sensor: SensorCfg,
 
         # 3.  Predict.
         fcst = backend.predict(df_future)
+        fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
 
         # 4.  Grab the first *true‑future* row and collect yhat₁ … yhatₙ.
         first_future = fcst[fcst["ds"] > last_ts].iloc[0]
