@@ -719,7 +719,17 @@ async def publish_forecasts(sensor: SensorCfg,
         yhat_level = np.array(yhat_level, dtype=float)
         yhat_level = np.nan_to_num(yhat_level, nan=0.0, posinf=0.0, neginf=0.0)
 
-    cum_from_now = np.cumsum(yhat_interval)
+    # ------------------------------------------------------------------
+    # *counter* sensors must continue from the last real reading
+    # ------------------------------------------------------------------
+    baseline = 0.0
+    if sensor.source_is_cumulative:
+        try:
+            baseline = float(await iface.get_state(sensor.name, default=0.0))
+        except Exception:
+            baseline = 0.0
+
+    cum_from_now = baseline + np.cumsum(yhat_interval)
     daily_cum = daily_cumulative_series(ds_future, yhat_interval, tz)
 
     ser_interval = dict_from_series(ds_future, yhat_interval, tz)
@@ -734,6 +744,7 @@ async def publish_forecasts(sensor: SensorCfg,
     }
 
     publish_units = sensor.output_units or sensor.units
+    state_class = ("total_increasing" if sensor.source_is_cumulativeelse role_cfg.publish_state_class)
 
     if sensor.publish_interval:
         ent_interval = make_entity_name(prefix, sensor.name, "interval")
@@ -755,7 +766,7 @@ async def publish_forecasts(sensor: SensorCfg,
             state=round(float(cum_from_now[-1]) if len(cum_from_now) else 0.0, 3),
             attributes={
                 "unit_of_measurement": publish_units,
-                "state_class": "measurement",
+                "state_class": state_class,
                 "forecast_series": ser_cum,
                 **meta,
             },
@@ -771,7 +782,7 @@ async def publish_forecasts(sensor: SensorCfg,
             state=round(float(state_val), 3),
             attributes={
                 "unit_of_measurement": publish_units,
-                "state_class": "measurement",
+                "state_class": state_class,
                 "forecast_series": daily_cum,
                 **meta,
             },
