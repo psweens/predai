@@ -892,8 +892,18 @@ async def run_sensor_job(sensor: SensorCfg,
         logger.warning("Sensor %s: no data; skipping.", sensor.name)
         return
 
-    # Resample
-    agg = sensor.effective_aggregation(role_cfg)
+    # --------------------------------------------------
+    # 1.  Convert the cumulative counter → interval NOW
+    # --------------------------------------------------
+    if sensor.source_is_cumulative:
+        df = cumulative_to_interval(df, sensor.reset_detection)
+    else:
+        df = df.rename(columns={"value": "y"})
+    
+    # --------------------------------------------------
+    # 2.  Resample the *interval* series (sum / mean / …)
+    # --------------------------------------------------
+    agg = sensor.effective_aggregation(role_cfg)      # keep "sum" for energy
     df = resample_sensor(df, freq, agg)
     logger.info(
         "Sensor %s: after resample %s rows from %s", sensor.name, len(df), freq
@@ -908,13 +918,6 @@ async def run_sensor_job(sensor: SensorCfg,
             df["value"] = df["value"] * (interval_min / 60.0)  # kWh per bucket
             if not sensor.output_units:
                 sensor.output_units = "kWh"
-
-    # Transform to modelling target
-    if sensor.source_is_cumulative:
-        df = cumulative_to_interval(df, sensor.reset_detection)
-    else:
-        df = df.rename(columns={"value": "y"})
-    logger.debug("Sensor %s: after transform rows=%s", sensor.name, len(df))
 
     # Clean
     df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0)
