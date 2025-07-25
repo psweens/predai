@@ -736,7 +736,8 @@ async def publish_forecasts(sensor: SensorCfg,
                             sensor_hist_cum: Optional[pd.DataFrame] = None):
     logger.info("Publishing forecasts for %s", sensor.name)
     tz = cfg.tz
-    used_today = energy_already_used_today(sensor_hist_cum or pd.DataFrame(), tz)
+    hist_df = sensor_hist_cum if sensor_hist_cum is not None else pd.DataFrame()
+    used_today = energy_already_used_today(hist_df, tz)
     prefix = cfg.publish_prefix
 
     yhat_interval = np.array(yhat_interval, dtype=float)
