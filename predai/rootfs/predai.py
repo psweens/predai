@@ -744,7 +744,7 @@ async def publish_forecasts(sensor: SensorCfg,
     }
 
     publish_units = sensor.output_units or sensor.units
-    state_class = ("total_increasing" if sensor.source_is_cumulativeelse role_cfg.publish_state_class)
+    state_class = ("total_increasing" if sensor.source_is_cumulative else role_cfg.publish_state_class)
 
     if sensor.publish_interval:
         ent_interval = make_entity_name(prefix, sensor.name, "interval")
