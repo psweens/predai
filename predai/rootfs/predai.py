@@ -553,6 +553,7 @@ class CovariateResolver:
                 "scale": val.get("scale", 1.0),
                 "attr": val.get("attr"),
                 "forecast_attr": val.get("forecast_attr"),
+                "units": val.get("units"),
             }
         return {"entity": str(val), "scale": 1.0}
 
@@ -583,6 +584,13 @@ class CovariateResolver:
             "Covariate %s: scaled by %s", cov_name, meta.get("scale", 1.0)
         )
         out = df.set_index("ds")["value"]
+        logger.info(
+            "Covariate %s: min=%s max=%s %s",
+            cov_name,
+            out.min(),
+            out.max(),
+            meta.get("units", ""),
+        )
         logger.debug(
             "Covariate %s: obtained %s rows", cov_name, len(out)
         )
@@ -604,6 +612,13 @@ class CovariateResolver:
         )
         logger.debug(
             "Covariate %s: future series len=%s", cov_name, len(future_index)
+        )
+        logger.info(
+            "Covariate %s future: min=%s max=%s %s",
+            cov_name,
+            v,
+            v,
+            meta.get("units", ""),
         )
         return pd.Series(v, index=future_index)
 
@@ -847,6 +862,14 @@ async def run_sensor_job(sensor: SensorCfg,
         df["ds"].min() if not df.empty else None,
         df["ds"].max() if not df.empty else None,
     )
+    if not df.empty:
+        logger.info(
+            "Sensor %s: min=%s max=%s %s",
+            sensor.name,
+            df["value"].min(),
+            df["value"].max(),
+            sensor.units or "",
+        )
 
     # DB merge
     if sensor.database and db:
@@ -915,6 +938,14 @@ async def run_sensor_job(sensor: SensorCfg,
     logger.info(
         "Sensor %s: training frame %s rows", sensor.name, len(train_df)
     )
+    if not train_df.empty:
+        logger.info(
+            "Sensor %s: training min=%s max=%s %s",
+            sensor.name,
+            train_df["y"].min(),
+            train_df["y"].max(),
+            sensor.output_units or sensor.units or "",
+        )
 
     if role_cfg.model_backend == "neuralprophet":
         steps = max(horizon_steps(m, interval_min) for m in cfg.horizons)
