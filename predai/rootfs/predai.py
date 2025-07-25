@@ -715,6 +715,9 @@ async def publish_forecasts(sensor: SensorCfg,
     yhat_interval = np.nan_to_num(yhat_interval, nan=0.0, posinf=0.0, neginf=0.0)
     yhat_interval = np.clip(yhat_interval, 0, None)  # no negatives
 
+    if (sensor.units or "").lower() == "wh" and (publish_units or "").lower().endswith("kwh"):
+        yhat_interval = yhat_interval / 1000.0
+
     if yhat_level is not None:
         yhat_level = np.array(yhat_level, dtype=float)
         yhat_level = np.nan_to_num(yhat_level, nan=0.0, posinf=0.0, neginf=0.0)
