@@ -893,21 +893,26 @@ async def run_sensor_job(sensor: SensorCfg,
         return
 
     # --------------------------------------------------
-    # 1.  Convert the cumulative counter → interval NOW
+    # 1.  Convert cumulative counter → interval
     # --------------------------------------------------
     if sensor.source_is_cumulative:
         df = cumulative_to_interval(df, sensor.reset_detection)
-    else:
-        df = df.rename(columns={"value": "y"})
+        # resampler needs a column called 'value', so replace it
+        df["value"] = df["y"]
     
     # --------------------------------------------------
-    # 2.  Resample the *interval* series (sum / mean / …)
+    # 2.  Resample the interval series (sum / mean / last)
     # --------------------------------------------------
     agg = sensor.effective_aggregation(role_cfg)      # keep "sum" for energy
     df = resample_sensor(df, freq, agg)
     logger.info(
         "Sensor %s: after resample %s rows from %s", sensor.name, len(df), freq
     )
+    
+    # --------------------------------------------------
+    # 3.  Rename value → y (now exists for *all* sensors)
+    # --------------------------------------------------
+    df = df.rename(columns={"value": "y"})
 
     # Power->energy (heuristic)
     if (not sensor.source_is_cumulative) and sensor.train_target == "interval":
