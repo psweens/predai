@@ -714,6 +714,17 @@ def daily_cumulative_series(index: Sequence[datetime], values: Sequence[float], 
     return out
 
 
+def energy_already_used_today(df_cum: pd.DataFrame, tz: timezone) -> float:
+    """Return the cumulative kWh that have been consumed *today*."""
+    if df_cum.empty:
+        return 0.0
+    today = datetime.now(tz).date()
+    today_rows = df_cum[df_cum["ds"].dt.date == today]
+    if today_rows.empty:
+        return 0.0
+    return float(today_rows["value"].iloc[-1])
+
+
 async def publish_forecasts(sensor: SensorCfg,
                             role_cfg: RoleCfg,
                             iface: HAInterface,
@@ -721,9 +732,11 @@ async def publish_forecasts(sensor: SensorCfg,
                             ds_future: Sequence[datetime],
                             yhat_interval: Sequence[float],
                             yhat_level: Optional[Sequence[float]] = None,
-                            metrics: Optional[dict] = None):
+                            metrics: Optional[dict] = None,
+                            sensor_hist_cum: Optional[pd.DataFrame] = None):
     logger.info("Publishing forecasts for %s", sensor.name)
     tz = cfg.tz
+    used_today = energy_already_used_today(sensor_hist_cum or pd.DataFrame(), tz)
     prefix = cfg.publish_prefix
 
     yhat_interval = np.array(yhat_interval, dtype=float)
@@ -827,6 +840,22 @@ async def publish_forecasts(sensor: SensorCfg,
             },
         )
 
+    for m in cfg.horizons:
+        suffix_tot = f"pred_total_{m//60}h"
+        ent_tot = make_entity_name(prefix, sensor.name, suffix_tot)
+        future_use = horizon_agg(yhat_interval, cfg.common_interval, m)
+        total_kwh = used_today + future_use
+        await iface.set_state(
+            ent_tot,
+            state=round(float(total_kwh), 3),
+            attributes={
+                "unit_of_measurement": publish_units,
+                "state_class": "measurement",
+                "generated_from": make_entity_name(prefix, sensor.name, "interval"),
+                **meta,
+            },
+        )
+
     logger.info("Finished publishing forecasts for %s", sensor.name)
 
 
@@ -891,6 +920,8 @@ async def run_sensor_job(sensor: SensorCfg,
     if df.empty:
         logger.warning("Sensor %s: no data; skipping.", sensor.name)
         return
+
+    df_cum_raw = df.copy()
 
     # --------------------------------------------------
     # 1.  Convert cumulative counter → interval
@@ -1067,7 +1098,8 @@ async def run_sensor_job(sensor: SensorCfg,
                      for i in range(1, steps + 1)]
 
         metrics = {"training_rows": int(len(train_df)), "mae_recent": None}
-        await publish_forecasts(sensor, role_cfg, iface, cfg, ds_future, yhat_int, metrics=metrics)
+        await publish_forecasts(sensor, role_cfg, iface, cfg, ds_future, yhat_int,
+                                metrics=metrics, sensor_hist_cum=df_cum_raw)
         logger.info("Sensor %s: forecasting complete", sensor.name)
 
     else:
