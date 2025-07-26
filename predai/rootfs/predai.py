@@ -851,6 +851,37 @@ async def publish_forecasts(sensor: SensorCfg,
             },
         )
 
+        # --------------------------------------------------------------
+        #  One-shot "initial" curve -> "…_curve_initial"
+        # --------------------------------------------------------------
+        def _same_day(ts1: str, ts2: str) -> bool:
+            try:
+                d1 = timestr_to_datetime(ts1).astimezone(tz).date()
+                d2 = timestr_to_datetime(ts2).astimezone(tz).date()
+                return d1 == d2
+            except Exception:
+                return False
+
+        ent_curve_init = make_entity_name(prefix, sensor.name, "pred_curve_initial")
+        existing = await iface.api_call("GET", f"/api/states/{ent_curve_init}")
+        need_update = True
+        if existing and "attributes" in existing:
+            old_ts = existing["attributes"].get("model_ts")
+            need_update = not _same_day(old_ts, model_ts_iso)
+
+        if need_update:
+            await iface.set_state(
+                ent_curve_init,
+                state=round(list(daily_cum.values())[-1], 3),
+                attributes={
+                    "unit_of_measurement": publish_units,
+                    "state_class": state_class,
+                    "forecast_series": daily_cum,
+                    "generated_from": make_entity_name(prefix, sensor.name, "interval"),
+                    **meta,
+                },
+            )
+
     # Horizon scalars
     for m in cfg.horizons:
         suffix = f"pred_{m//60}h"
