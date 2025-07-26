@@ -150,6 +150,7 @@ class SensorCfg:
 
     database: bool = True
     max_age: int = 365
+    max_increment: Optional[float] = None
 
     plot: bool = False
     cascade_outputs: Dict[str, bool] = field(default_factory=dict)
@@ -243,6 +244,7 @@ def _load_sensor(dflt: Dict[str, Any], d: Dict[str, Any]) -> SensorCfg:
         country=merged.get("country"),
         database=merged.get("database", True),
         max_age=merged.get("max_age", 365),
+        max_increment=merged.get("max_increment"),
         plot=merged.get("plot", False),
         cascade_outputs=merged.get("cascade_outputs", {}) or {},
     )
@@ -478,7 +480,7 @@ def resample_sensor(df: pd.DataFrame, freq: str, how: str) -> pd.DataFrame:
     return out
 
 
-def cumulative_to_interval(df: pd.DataFrame, reset_cfg: ResetDetectionCfg) -> pd.DataFrame:
+def cumulative_to_interval(df: pd.DataFrame, reset_cfg: ResetDetectionCfg, max_increment: Optional[float] = None) -> pd.DataFrame:
     if df.empty:
         df["y"] = []
         return df
@@ -496,14 +498,20 @@ def cumulative_to_interval(df: pd.DataFrame, reset_cfg: ResetDetectionCfg) -> pd
             for i in np.where(reset_mask)[0]:
                 delta[i] = v[i]
     delta[neg_mask] = np.nan
+    spike_count = 0
+    if max_increment is not None:
+        spike_mask = np.abs(delta) > max_increment
+        spike_count = int(np.sum(spike_mask))
+        delta[spike_mask] = np.nan
     delta = np.nan_to_num(delta, nan=0.0)
     delta = np.clip(delta, 0.0, None)
     df["y"] = delta
     logger.debug(
-        "Cumulative->interval result rows=%s neg=%s resets=%s",
+        "Cumulative->interval result rows=%s neg=%s resets=%s spikes=%s",
         len(df),
         int(neg_mask.sum()),
         reset_count,
+        spike_count,
     )
     return df
 
@@ -974,7 +982,7 @@ async def run_sensor_job(sensor: SensorCfg,
     # 1.  Convert cumulative counter → interval
     # --------------------------------------------------
     if sensor.source_is_cumulative:
-        df = cumulative_to_interval(df, sensor.reset_detection)
+        df = cumulative_to_interval(df, sensor.reset_detection, sensor.max_increment)
         # resampler needs a column called 'value', so replace it
         df["value"] = df["y"]
     
