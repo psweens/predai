@@ -713,22 +713,6 @@ def daily_cumulative_series(index: Sequence[datetime], values: Sequence[float], 
         out[lts.strftime(TIME_FORMAT_HA)] = round(cum, 3)
     return out
 
-def cumulative_curve_series(index: Sequence[datetime],
-                            values: Sequence[float],
-                            tz: timezone) -> Dict[str, float]:
-    """Return dict {timestamp ISO → cum kWh}, resetting at each midnight."""
-    cum = 0.0
-    out = {}
-    current_day = None
-    for ts, v in zip(index, values):
-        lts = ensure_utc(ts).astimezone(tz)
-        if current_day != lts.date():
-            cum = 0.0
-            current_day = lts.date()
-        cum += max(float(v), 0.0)
-        out[lts.strftime(TIME_FORMAT_HA)] = round(cum, 3)
-    return out
-
 def energy_already_used_today(df_cum: pd.DataFrame, tz: timezone) -> float:
     """Return the cumulative kWh that have been consumed *today*."""
     if df_cum.empty:
@@ -778,7 +762,6 @@ async def publish_forecasts(sensor: SensorCfg,
 
     cum_from_now = baseline + np.cumsum(yhat_interval)
     daily_cum = daily_cumulative_series(ds_future, yhat_interval, tz)
-    curve_48h = daily_cumulative_series(ds_future, yhat_interval, tz)
 
     ser_interval = dict_from_series(ds_future, yhat_interval, tz)
     ser_cum = dict_from_series(ds_future, cum_from_now, tz)
@@ -832,19 +815,6 @@ async def publish_forecasts(sensor: SensorCfg,
                 "unit_of_measurement": publish_units,
                 "state_class": state_class,
                 "forecast_series": daily_cum,
-                **meta,
-            },
-        )
-
-        ent_curve = make_entity_name(prefix, sensor.name, "pred_curve")
-        await iface.set_state(
-            ent_curve,
-            state=round(list(curve_48h.values())[-1], 3),
-            attributes={
-                "unit_of_measurement": publish_units,
-                "state_class": "measurement",
-                "forecast_series": curve_48h,
-                "generated_from": make_entity_name(prefix, sensor.name, "interval"),
                 **meta,
             },
         )
