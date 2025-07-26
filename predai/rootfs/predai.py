@@ -761,7 +761,14 @@ async def publish_forecasts(sensor: SensorCfg,
             baseline = 0.0
 
     cum_from_now = baseline + np.cumsum(yhat_interval)
+    # - Daily cumulative forecast starting from the energy already used today so
+    #   the curve meets the live meter reading at 'now'.
     daily_cum = daily_cumulative_series(ds_future, yhat_interval, tz)
+
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    for ts_iso in list(daily_cum.keys()):
+        if ts_iso.startswith(today_str):
+            daily_cum[ts_iso] += used_today
 
     ser_interval = dict_from_series(ds_future, yhat_interval, tz)
     ser_cum = dict_from_series(ds_future, cum_from_now, tz)
