@@ -819,6 +819,31 @@ async def publish_forecasts(sensor: SensorCfg,
             },
         )
 
+        # --------------------------------------------------------------
+        #  Preserve the previous forecast curve → “…_curve_yesterday”
+        # --------------------------------------------------------------
+        ent_curve      = make_entity_name(prefix, sensor.name, "pred_curve")
+        ent_curve_prev = make_entity_name(prefix, sensor.name, "curve_yesterday")
+
+        old_item = await iface.api_call("GET", f"/api/states/{ent_curve}")
+        if old_item:
+            await iface.set_state(
+                ent_curve_prev,
+                state=old_item.get("state", 0),
+                attributes=old_item.get("attributes", {}),
+            )
+
+        await iface.set_state(
+            ent_curve,
+            state=round(list(daily_cum.values())[-1], 3),
+            attributes={
+                "unit_of_measurement": publish_units,
+                "state_class": state_class,
+                "forecast_series": daily_cum,
+                **meta,
+            },
+        )
+
     # Horizon scalars
     for m in cfg.horizons:
         suffix = f"pred_{m//60}h"
