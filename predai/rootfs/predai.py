@@ -128,6 +128,14 @@ class SensorCfg:
     days_hist: int = 7
     export_days: Optional[int] = None
 
+    subtract: List[str] = field(default_factory=list)
+    incrementing: bool = False
+    reset_daily: bool = False
+    interval: Optional[int] = None
+    future_periods: Optional[int] = None
+    reset_low: Optional[float] = None
+    reset_high: Optional[float] = None
+
     source_is_cumulative: bool = False
     train_target: str = "interval"            # interval|level|cumulative
     aggregation: Optional[str] = None         # resample override
@@ -220,6 +228,20 @@ def _load_sensor(dflt: Dict[str, Any], d: Dict[str, Any]) -> SensorCfg:
         high=rd_map.get("high", 2.0),
         hard_reset_value=rd_map.get("hard_reset_value"),
     )
+    subtract_val = merged.get("subtract", [])
+    if isinstance(subtract_val, str):
+        subtract_list = [subtract_val]
+    else:
+        subtract_list = list(subtract_val) if subtract_val else []
+
+    incrementing_val = merged.get("incrementing")
+    if incrementing_val is not None:
+        merged.setdefault("source_is_cumulative", bool(incrementing_val))
+
+    if merged.get("reset_low") is not None:
+        rd.low = float(merged["reset_low"])
+    if merged.get("reset_high") is not None:
+        rd.high = float(merged["reset_high"])
     return SensorCfg(
         name=merged["name"],
         role=merged.get("role", "incrementing_energy"),
@@ -227,6 +249,13 @@ def _load_sensor(dflt: Dict[str, Any], d: Dict[str, Any]) -> SensorCfg:
         output_units=merged.get("output_units"),
         days_hist=merged.get("days", merged.get("days_hist", 7)),
         export_days=merged.get("export_days"),
+        subtract=subtract_list,
+        incrementing=bool(incrementing_val) if incrementing_val is not None else False,
+        reset_daily=merged.get("reset_daily", False),
+        interval=merged.get("interval"),
+        future_periods=merged.get("future_periods"),
+        reset_low=merged.get("reset_low"),
+        reset_high=merged.get("reset_high"),
         source_is_cumulative=merged.get("source_is_cumulative", False),
         train_target=merged.get("train_target", "interval"),
         aggregation=merged.get("aggregation"),
@@ -531,6 +560,19 @@ def invert_log_transform(arr: np.ndarray, applied: bool) -> np.ndarray:
     return np.expm1(arr)
 
 
+def subtract_set(base: pd.DataFrame, sub: pd.DataFrame, *, inc: bool = False) -> pd.DataFrame:
+    """Subtract one dataset from another by timestamp."""
+    if base.empty:
+        return base
+    merged = base.merge(sub, on="ds", how="left", suffixes=("", "_sub"))
+    merged["y_sub"].fillna(0, inplace=True)
+    merged["y"] = merged.apply(
+        lambda row: max(row["y"] - row["y_sub"], 0) if inc else row["y"] - row["y_sub"],
+        axis=1,
+    )
+    return merged[["ds", "y"]]
+
+
 # --------------------------------------------------------------------------- #
 # CovariateResolver
 # --------------------------------------------------------------------------- #
@@ -743,6 +785,7 @@ async def publish_forecasts(sensor: SensorCfg,
                             sensor_hist_cum: Optional[pd.DataFrame] = None):
     logger.info("Publishing forecasts for %s", sensor.name)
     tz = cfg.tz
+    interval_min = sensor.interval or cfg.common_interval
     hist_df = sensor_hist_cum if sensor_hist_cum is not None else pd.DataFrame()
     used_today = energy_already_used_today(hist_df, tz)
     prefix = cfg.publish_prefix
@@ -769,6 +812,13 @@ async def publish_forecasts(sensor: SensorCfg,
             baseline = 0.0
 
     cum_from_now = baseline + np.cumsum(yhat_interval)
+    if sensor.reset_daily and sensor.source_is_cumulative:
+        midnight = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        for i, ts in enumerate(ds_future):
+            if ensure_utc(ts).astimezone(tz) >= midnight:
+                reset_val = cum_from_now[i-1] if i > 0 else baseline
+                cum_from_now[i:] -= reset_val
+                break
     # - Daily cumulative forecast starting from the energy already used today so
     #   the curve meets the live meter reading at 'now'.
     daily_cum = daily_cumulative_series(ds_future, yhat_interval, tz)
@@ -896,10 +946,10 @@ async def publish_forecasts(sensor: SensorCfg,
         ent_h = make_entity_name(prefix, sensor.name, suffix)
         if sensor.train_target == "level":  # e.g., temperature
             arr = np.array(yhat_level if yhat_level is not None else yhat_interval)
-            steps = min(horizon_steps(m, cfg.common_interval), len(arr))
+            steps = min(horizon_steps(m, interval_min), len(arr))
             val = arr[steps - 1]
         else:
-            val = horizon_agg(yhat_interval, cfg.common_interval, m)
+            val = horizon_agg(yhat_interval, interval_min, m)
         await iface.set_state(
             ent_h,
             state=round(float(val), 3),
@@ -924,7 +974,7 @@ async def run_sensor_job(sensor: SensorCfg,
                          iface: HAInterface,
                          cov_res: CovariateResolver,
                          db: Optional[HistoryDB]) -> None:
-    interval_min = cfg.common_interval
+    interval_min = sensor.interval or cfg.common_interval
     freq = f"{interval_min}min"
     tz = cfg.tz
 
@@ -1000,6 +1050,19 @@ async def run_sensor_job(sensor: SensorCfg,
     # --------------------------------------------------
     df = df.rename(columns={"value": "y"})
 
+    if sensor.subtract:
+        for sub_name in sensor.subtract:
+            logger.info("Sensor %s: subtracting %s", sensor.name, sub_name)
+            raw_sub, _, _ = await iface.get_history(sub_name, start_hist, end_hist)
+            sub_df = normalise_history(raw_sub)
+            if sensor.source_is_cumulative or sensor.incrementing:
+                sub_df = cumulative_to_interval(sub_df, sensor.reset_detection, sensor.max_increment)
+                sub_df["value"] = sub_df["y"]
+            sub_df = resample_sensor(sub_df, freq, agg)
+            sub_df = sub_df.rename(columns={"value": "y"})
+            sub_df["y"] = pd.to_numeric(sub_df["y"], errors="coerce").fillna(0.0)
+            df = subtract_set(df, sub_df, inc=sensor.incrementing or sensor.source_is_cumulative)
+
     # Power->energy (heuristic)
     if (not sensor.source_is_cumulative) and sensor.train_target == "interval":
         units_lower = (sensor.units or "").lower()
@@ -1042,7 +1105,9 @@ async def run_sensor_job(sensor: SensorCfg,
         )
 
     if role_cfg.model_backend == "neuralprophet":
-        steps = max(horizon_steps(m, interval_min) for m in cfg.horizons)
+        steps = sensor.future_periods if sensor.future_periods is not None else max(
+            horizon_steps(m, interval_min) for m in cfg.horizons
+        )
         backend = NPBackend(
             n_lags=sensor.effective_n_lags(role_cfg),
             n_forecasts=steps,
@@ -1090,7 +1155,9 @@ async def run_sensor_job(sensor: SensorCfg,
         # ------------------------------------------------------------------
         # Future frame + prediction  ✱ handles future‑regressor check
         # ------------------------------------------------------------------
-        steps = max(horizon_steps(m, interval_min) for m in cfg.horizons)
+        steps = sensor.future_periods if sensor.future_periods is not None else max(
+            horizon_steps(m, interval_min) for m in cfg.horizons
+        )
 
         last_ts = train_df["ds"].max()
 

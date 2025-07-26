@@ -55,21 +55,20 @@ sensors:
 **Sensors** This is an array of entities to predict the future on
 
   - **Name** Give the name of the entity exactly as in Home Assistant
-  - **Subtact** can be used to subtract another numerical value from the first entity, mostly used to remove things like car charging from energy data. Can also be a list of sensor names to subtract.
+  - **Subtract** can be used to subtract another numerical value from the first entity, mostly used to remove things like car charging from energy data. Can also be a list of sensor names to subtract.
   - **days** Sets how many days in the past to take the history from
-  - **incrementing** - When true the sensor is always incrementing (e.g. energy used), but can include resets. When False they are individual values.
+  - **incrementing** - When true the sensor is always incrementing (e.g. energy used), but can include resets. When False they are individual values.  This maps to the newer `source_is_cumulative` option.
   - **max_increment** - Defines the maximum increase or decrease an incrementing sensor can have before it's considered a spike and ignored. Spikes are dropped when converting cumulative values to interval series.
   - **reset_daily** - When true the sensor value is reset to 0 at midnight (e.g. energy per day)
-  - **interval** - Sets the prediction inverval, should divide into 60 e.g. 5, 10 , 15 , 30
+  - **interval** - Sets the prediction interval, should divide into 60 e.g. 5, 10, 15, 30.  When omitted the global `common_interval` is used.
   - **Units** - Sets the unit the model operates in and publishes to Home Assistant.  PredAI will
     automatically convert between `Wh` and `kWh` if the sensor's actual
     `unit_of_measurement` differs from this value.
-  - **future_periods** - Sets the number of periods (of interval minutes) to predict into the future, 100 is recommended for Predbat use to cover 48 hours + time until the next PredAI run.
+  - **future_periods** - Sets the number of periods (of interval minutes) to predict into the future. If omitted, the forecast horizon is derived from `horizons`.
   - **database** - When True (default) all data is stored in a sqllite3 database in the addon directory, this will keep a full history beyond what HA keeps and use
 that history for training. You can browse the data using an SQL Lite viewer on your computer.
   - **export_days** - Sets how many days of history to include in the HA entities that are created, recommended values are 7-14. The default is **days**
-  - **reset_low/reset_high** - For incrementing sensors if the sensor goes above **reset_high** and then falls below **reset_low** then its considered a reset even
-  if it never goes to 0.
+  - **reset_low/reset_high** - For incrementing sensors if the sensor goes above **reset_high** and then falls below **reset_low** then its considered a reset even if it never goes to 0. These values populate `reset_detection.low` and `reset_detection.high` in the modern configuration.
   - **country** - When set adds in the specified countries holidays (see https://python-holidays.readthedocs.io/en/latest/)
   - **covariates** - List of sensor entity_ids used as lagged regressors
   - **future_covariates** - List of sensor entity_ids that provide values for both history and future
