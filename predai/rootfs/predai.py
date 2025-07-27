@@ -786,9 +786,16 @@ async def publish_forecasts(sensor: SensorCfg,
     logger.info("Publishing forecasts for %s", sensor.name)
     tz = cfg.tz
     interval_min = sensor.interval or cfg.common_interval
-    hist_df = sensor_hist_cum if sensor_hist_cum is not None else pd.DataFrame()
+    hist_df   = sensor_hist_cum if sensor_hist_cum is not None else pd.DataFrame()
     used_today = energy_already_used_today(hist_df, tz)
-    prefix = cfg.publish_prefix
+    prefix    = cfg.publish_prefix
+
+    # ── Clip any forecast buckets that lie in the past ─────────────────────
+    now_local = datetime.now(tz)
+    for i, ts in enumerate(ds_future):
+        if ensure_utc(ts).astimezone(tz) < now_local:
+            yhat_interval[i] = 0.0
+    # ───────────────────────────────────────────────────────────────────────
 
     yhat_interval = np.array(yhat_interval, dtype=float)
     yhat_interval = np.nan_to_num(yhat_interval, nan=0.0, posinf=0.0, neginf=0.0)
@@ -811,6 +818,11 @@ async def publish_forecasts(sensor: SensorCfg,
         except Exception:
             baseline = 0.0
 
+        # If the meter resets at midnight, start the forecast curve at the
+        # energy already used today so orange & blue meet at "now".
+        if sensor.reset_daily:
+            baseline = used_today
+
     cum_from_now = baseline + np.cumsum(yhat_interval)
     if sensor.reset_daily and sensor.source_is_cumulative:
         midnight = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
@@ -821,9 +833,9 @@ async def publish_forecasts(sensor: SensorCfg,
                 break
     # - Daily cumulative forecast starting from the energy already used today so
     #   the curve meets the live meter reading at 'now'.
+    # Re-build daily cumulative after clipping & baseline offset
     daily_cum = daily_cumulative_series(ds_future, yhat_interval, tz)
-
-    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    today_str = now_local.strftime("%Y-%m-%d")
     for ts_iso in list(daily_cum.keys()):
         if ts_iso.startswith(today_str):
             daily_cum[ts_iso] += used_today
