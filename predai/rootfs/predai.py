@@ -78,14 +78,32 @@ logger.setLevel(logging.DEBUG)
 # --------------------------------------------------------------------------- #
 
 def timestr_to_datetime(timestamp: str) -> Optional[datetime]:
+    """Parse a Home‑Assistant timestamp and return a tz‑aware datetime
+    rounded to the nearest minute (seconds & microseconds cleared).
+
+    Accepts:
+      • ISO‑8601 with colon in offset, e.g. '2025‑07‑28T10:47:12+01:00'
+      • ISO‑8601 with fractional seconds
+      • Legacy HA formats without the colon
+    """
     if not timestamp:
         return None
+
+    # 1.  Robust ISO parser (handles “+01:00”)
+    try:
+        dt = datetime.fromisoformat(timestamp)
+        return dt.replace(second=0, microsecond=0)
+    except ValueError:
+        pass  # fall back to legacy formats
+
+    # 2.  Legacy formats
     for fmt in (TIME_FORMAT_HA, TIME_FORMAT_HA_DOT):
         try:
             dt = datetime.strptime(timestamp, fmt)
             return dt.replace(second=0, microsecond=0)
         except ValueError:
             continue
+
     return None
 
 
@@ -954,6 +972,41 @@ async def publish_forecasts(sensor: SensorCfg,
                     **meta,
                 },
             )
+
+        # --------------------------------------------------------------
+        #  Rolling 7‑day buffer of initial curves  → “…_pred_curve_initial_7d”
+        # --------------------------------------------------------------
+        ent_curve_hist = make_entity_name(prefix, base_name, "pred_curve_initial_7d")
+        today_key = now_local.strftime("%Y-%m-%d")
+
+        # 1.  Load existing map (if any)
+        prev_item = await iface.api_call("GET", f"/api/states/{ent_curve_hist}")
+        hist_map: Dict[str, Any] = {}
+        if prev_item and "attributes" in prev_item:
+            hist_map = prev_item["attributes"].get("forecast_series_map", {}) or {}
+
+        # 2.  Prune to the most‑recent six previous days
+        cutoff = now_local.date() - timedelta(days=6)
+        hist_map = {
+            d: s for d, s in hist_map.items()
+            if datetime.fromisoformat(d).date() >= cutoff
+        }
+
+        # 3.  Add today’s curve only if not already present
+        if today_key not in hist_map:
+            hist_map[today_key] = daily_cum
+
+        # 4.  Publish / overwrite the rolling sensor
+        await iface.set_state(
+            ent_curve_hist,
+            state=round(list(daily_cum.values())[-1], 3),
+            attributes={
+                "unit_of_measurement": publish_units,
+                "state_class": state_class,
+                "forecast_series_map": hist_map,
+                **meta,
+            },
+        )
 
     # Horizon scalars
     for m in cfg.horizons:
