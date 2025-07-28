@@ -20,6 +20,7 @@ update_every: 30
 #    reset_low: 1.0  # maps to reset_detection.low
 #    reset_high: 2.0 # maps to reset_detection.high
 #    country: UK
+#    publish_name: my_custom_base
 #    max_age: 365
 #  - name: sensor.external_temperature
 #    days: 14

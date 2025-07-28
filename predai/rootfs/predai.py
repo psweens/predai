@@ -162,6 +162,7 @@ class SensorCfg:
 
     plot: bool = False
     cascade_outputs: Dict[str, bool] = field(default_factory=dict)
+    publish_name: Optional[str] = None
 
     def effective_aggregation(self, role_cfg: RoleCfg) -> str:
         return self.aggregation or role_cfg.aggregation
@@ -276,6 +277,7 @@ def _load_sensor(dflt: Dict[str, Any], d: Dict[str, Any]) -> SensorCfg:
         max_increment=merged.get("max_increment"),
         plot=merged.get("plot", False),
         cascade_outputs=merged.get("cascade_outputs", {}) or {},
+        publish_name=merged.get("publish_name"),
     )
 
 
@@ -789,6 +791,7 @@ async def publish_forecasts(sensor: SensorCfg,
     hist_df   = sensor_hist_cum if sensor_hist_cum is not None else pd.DataFrame()
     used_today = energy_already_used_today(hist_df, tz)
     prefix    = cfg.publish_prefix
+    base_name = sensor.publish_name or sensor.name
 
     # ── Clip any forecast buckets that lie in the past ─────────────────────
     now_local = datetime.now(tz)
@@ -855,7 +858,7 @@ async def publish_forecasts(sensor: SensorCfg,
     state_class = ("total_increasing" if sensor.source_is_cumulative else role_cfg.publish_state_class)
 
     if sensor.publish_interval:
-        ent_interval = make_entity_name(prefix, sensor.name, "interval")
+        ent_interval = make_entity_name(prefix, base_name, "interval")
         await iface.set_state(
             ent_interval,
             state=round(float(yhat_interval[0]) if len(yhat_interval) else 0.0, 3),
@@ -868,7 +871,7 @@ async def publish_forecasts(sensor: SensorCfg,
         )
 
     if sensor.publish_cumulative:
-        ent_cum = make_entity_name(prefix, sensor.name, "cum")
+        ent_cum = make_entity_name(prefix, base_name, "cum")
         await iface.set_state(
             ent_cum,
             state=round(float(cum_from_now[-1]) if len(cum_from_now) else 0.0, 3),
@@ -881,7 +884,7 @@ async def publish_forecasts(sensor: SensorCfg,
         )
 
     if sensor.publish_daily_cumulative:
-        ent_daily = make_entity_name(prefix, sensor.name, "daily_cum")
+        ent_daily = make_entity_name(prefix, base_name, "daily_cum")
         today_str = datetime.now(tz).strftime("%Y-%m-%d")
         todays = {k: v for k, v in daily_cum.items() if k.startswith(today_str)}
         state_val = list(todays.values())[-1] if todays else list(daily_cum.values())[-1]
@@ -899,8 +902,8 @@ async def publish_forecasts(sensor: SensorCfg,
         # --------------------------------------------------------------
         #  Preserve the previous forecast curve → “…_curve_yesterday”
         # --------------------------------------------------------------
-        ent_curve      = make_entity_name(prefix, sensor.name, "pred_curve")
-        ent_curve_prev = make_entity_name(prefix, sensor.name, "curve_yesterday")
+        ent_curve      = make_entity_name(prefix, base_name, "pred_curve")
+        ent_curve_prev = make_entity_name(prefix, base_name, "curve_yesterday")
 
         old_item = await iface.api_call("GET", f"/api/states/{ent_curve}")
         if old_item:
@@ -932,7 +935,7 @@ async def publish_forecasts(sensor: SensorCfg,
             except Exception:
                 return False
 
-        ent_curve_init = make_entity_name(prefix, sensor.name, "pred_curve_initial")
+        ent_curve_init = make_entity_name(prefix, base_name, "pred_curve_initial")
         existing = await iface.api_call("GET", f"/api/states/{ent_curve_init}")
         need_update = True
         if existing and "attributes" in existing:
@@ -947,7 +950,7 @@ async def publish_forecasts(sensor: SensorCfg,
                     "unit_of_measurement": publish_units,
                     "state_class": state_class,
                     "forecast_series": daily_cum,
-                    "generated_from": make_entity_name(prefix, sensor.name, "interval"),
+                    "generated_from": make_entity_name(prefix, base_name, "interval"),
                     **meta,
                 },
             )
@@ -955,7 +958,7 @@ async def publish_forecasts(sensor: SensorCfg,
     # Horizon scalars
     for m in cfg.horizons:
         suffix = f"pred_{m//60}h"
-        ent_h = make_entity_name(prefix, sensor.name, suffix)
+        ent_h = make_entity_name(prefix, base_name, suffix)
         if sensor.train_target == "level":  # e.g., temperature
             arr = np.array(yhat_level if yhat_level is not None else yhat_interval)
             steps = min(horizon_steps(m, interval_min), len(arr))
@@ -968,7 +971,7 @@ async def publish_forecasts(sensor: SensorCfg,
             attributes={
                 "unit_of_measurement": publish_units,
                 "state_class": "measurement",
-                "generated_from": make_entity_name(prefix, sensor.name, "interval"),
+                "generated_from": make_entity_name(prefix, base_name, "interval"),
                 **meta,
             },
         )

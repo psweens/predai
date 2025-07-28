@@ -70,6 +70,7 @@ that history for training. You can browse the data using an SQL Lite viewer on y
   - **export_days** - Sets how many days of history to include in the HA entities that are created, recommended values are 7-14. The default is **days**
   - **reset_low/reset_high** - For incrementing sensors if the sensor goes above **reset_high** and then falls below **reset_low** then its considered a reset even if it never goes to 0. These values populate `reset_detection.low` and `reset_detection.high` in the modern configuration.
   - **country** - When set adds in the specified countries holidays (see https://python-holidays.readthedocs.io/en/latest/)
+  - **publish_name** - Base name for the forecast sensors. Defaults to the source sensor name
   - **covariates** - List of sensor entity_ids used as lagged regressors
   - **future_covariates** - List of sensor entity_ids that provide values for both history and future
   - **covariate map** - Under the top level `covariates:` section you can alias
@@ -77,7 +78,7 @@ that history for training. You can browse the data using an SQL Lite viewer on y
     `aggregation` override. `forecast_attr` is used when fetching future values
     and falls back to `attr` if missing.
 
-A new sensor with the name **name**_prediction will be created, this will contain two series:
+Predicted values are published as new sensors whose name is derived from `publish_name` (defaulting to the source `name`). Each sensor contains two series:
   - **results** contains the time series of the predictions, starts in the past so you can plot corrolation
   - **source** contains the original source data that was used to make the prediction
 
