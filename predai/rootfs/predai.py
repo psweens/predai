@@ -715,7 +715,7 @@ class NPBackend:
         )
         if learning_rate is not None:
             kw["learning_rate"] = learning_rate
-        self.model = NeuralProphet(**kw)
+        self.model = NeuralProphet(**kw, drop_missing=True)
         if country:
             self.model.add_country_holidays(country)
         self.fitted = False
@@ -1263,6 +1263,28 @@ async def run_sensor_job(sensor: SensorCfg,
                 fut_series = await cov_res.get_future_series(cov, fut_idx, default=0.0)
                 df_future.loc[fut_mask, cov] = fut_series.to_numpy()
 
+        # 4B. Enforce a clean, regular, unique time grid and no NaNs for the exact columns the model expects.
+        cols_needed = {"ds"}
+        try:
+            cols_needed |= set(backend.model.config_normalization.get("regressors", []))
+        except Exception:
+            pass
+        if "y" in df_future.columns:
+            cols_needed.add("y")
+        
+        # 1) Sort and de-dupe on ds (keep the last occurrence)
+        df_future = df_future.sort_values("ds")
+        df_future = df_future.drop_duplicates(subset=["ds"], keep="last")
+        
+        # 2) Drop any rows that still have NaNs in required cols
+        df_future = df_future.dropna(subset=list(cols_needed))
+        
+        # 3) (Belt-and-braces) restrict to exactly the columns NP expects (+ds)
+        extra = [c for c in df_future.columns if c not in cols_needed]
+        if extra:
+            logger.warning("Dropping unexpected columns before predict: %s", extra)
+            df_future = df_future.drop(columns=extra)
+                
         # 5.  Predict.
         fcst = backend.predict(df_future)
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
