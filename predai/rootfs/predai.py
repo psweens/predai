@@ -1301,7 +1301,18 @@ async def run_sensor_job(sensor: SensorCfg,
             logger.warning("Dropping unexpected columns before predict: %s", extra)
             df_future = df_future.drop(columns=extra)
 
+        try:
+            max_lags = int(getattr(backend.model, "max_lags", 0))
+        except Exception:
+            max_lags = sensor.effective_n_lags(role_cfg) or 0
         
+        steps = sensor.future_periods if sensor.future_periods is not None else max(
+            horizon_steps(m, interval_min) for m in cfg.horizons
+        )
+        
+        df_future = df_future.sort_values("ds").drop_duplicates(subset=["ds"], keep="last")
+        keep = max(steps + max_lags, steps)
+        df_future = df_future.tail(keep)
                         
         # 5.  Predict.
         fcst = backend.predict(df_future)
