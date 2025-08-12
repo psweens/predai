@@ -1263,64 +1263,44 @@ async def run_sensor_job(sensor: SensorCfg,
                 fut_series = await cov_res.get_future_series(cov, fut_idx, default=0.0)
                 df_future.loc[fut_mask, cov] = fut_series.to_numpy()
 
-        # 4B. Build the exact set of columns the model expects (future + lagged),
-        #     then ensure those columns exist and are non-NaN before predict.
+        # 4B. Enforce clean schema for predict() based on what we used at fit-time.
+        #     This works across NP versions.
         
-        def _np_expected_cols(model) -> tuple[set, set, set]:
-            exp = {"ds", "y"}
-            fut = set()
-            lag = set()
+        # Everything we trained with (including lagged + future regressors)
+        expected = list(train_df.columns)            # e.g., ['ds','y','sensor.current_charge', ...]
+        expected_set = set(expected)
         
-            # Primary source (newer NP)
-            cn = getattr(model, "config_normalization", {}) or {}
-            fut |= set(cn.get("regressors", []))
-            # NeuralProphet sometimes stores lagged names under one of these:
-            for key in ("lagged_regressors", "lagged_regressors_x"):
-                lag |= set(cn.get(key, []))
-        
-            # Fallbacks (older NP builds)
-            cfg_fut = getattr(model, "config_regressors", None)
-            if getattr(cfg_fut, "regressors", None):
-                fut |= set(getattr(cfg_fut, "regressors").keys())
-            cfg_lag = getattr(model, "config_lagged_regressors", None)
-            if getattr(cfg_lag, "regressors", None):
-                lag |= set(getattr(cfg_lag, "regressors").keys())
-        
-            exp |= fut | lag
-            return exp, fut, lag
-        
-        expected, fut_names, lag_names = _np_expected_cols(backend.model)
-        
-        # Sort and de-dupe by timestamp first
+        # i) Sort & de-dupe by timestamp
         df_future = df_future.sort_values("ds").drop_duplicates(subset=["ds"], keep="last")
         
-        # Ensure every expected regressor column exists before any dropping
-        for col in (expected - {"ds", "y"}):
+        # ii) Ensure every expected column exists in df_future
+        for col in expected:
+            if col == "ds":
+                continue
             if col not in df_future.columns:
-                # for lagged: seed with last observed value from train_df if available; else 0.0
-                if col in lag_names and col in train_df.columns and pd.notna(train_df[col].iloc[-1]):
-                    df_future[col] = train_df[col].iloc[-1]
-                else:
-                    df_future[col] = 0.0
+                # seed from last observed training value if available, else 0.0
+                seed = train_df[col].iloc[-1] if col in train_df.columns and pd.notna(train_df[col].iloc[-1]) else 0.0
+                df_future[col] = seed
         
-        # Overwrite FUTURE regressors on true-future rows with real values from HA
-        if fut_names:
+        # iii) Overwrite *future* regressors on true-future rows with live values
+        if sensor.covariates_future:
             fut_mask = df_future["ds"] > last_ts
             fut_idx = df_future.loc[fut_mask, "ds"]
-            for cov in fut_names:
-                if cov in sensor.covariates_future:
+            for cov in sensor.covariates_future:
+                if cov in expected_set:  # only if present at fit-time
                     s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
                     df_future.loc[fut_mask, cov] = s.to_numpy()
         
-        # Final fill (no NaNs left in required cols)
-        need_fill = sorted(list((expected - {"ds"})))
+        # iv) No NaNs in required cols
+        need_fill = [c for c in expected if c != "ds"]
         df_future[need_fill] = df_future[need_fill].ffill().fillna(0.0)
         
-        # Optionally drop truly extra columns (safe now)
-        extra = [c for c in df_future.columns if c not in expected]
+        # v) Drop any columns that were NOT present at fit-time (avoids "Unexpected column …")
+        extra = [c for c in df_future.columns if c not in expected_set | {"ds"}]
         if extra:
             logger.warning("Dropping unexpected columns before predict: %s", extra)
             df_future = df_future.drop(columns=extra)
+
         
                         
         # 5.  Predict.
