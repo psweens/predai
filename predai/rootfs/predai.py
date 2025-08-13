@@ -738,7 +738,7 @@ class NPBackend:
         """Wrapper around NP.make_future_dataframe that works across NP versions."""
         kw = dict(df=df, n_historic_predictions=historic, periods=periods)
         if future_regressors is not None:
-            # NP ≥0.6 uses 'future_regressors'; older builds used 'regressors_df'
+            # NP ≥0.6 uses future_regressors=; some older builds used regressors_df=
             try:
                 return self.model.make_future_dataframe(**kw, future_regressors=future_regressors)
             except TypeError:
@@ -1236,14 +1236,22 @@ async def run_sensor_job(sensor: SensorCfg,
         logger.info("Sensor %s: model trained", sensor.name)
 
         # ------------------------------------------------------------------
-        # Future frame + prediction — provide explicit future regressor values
+        # Future frame + prediction — pass exogenous columns + future values
         # ------------------------------------------------------------------
         steps = sensor.future_periods if sensor.future_periods is not None else max(
             horizon_steps(m, interval_min) for m in cfg.horizons
         )
         last_ts = train_df["ds"].max()
 
-        # Build the future timestamp index (UTC)
+        # The model was fit on train_df, which already includes any exogenous
+        # columns (lagged + future). Older NP versions require those columns to
+        # also be present in the 'df' passed to make_future_dataframe(...).
+        # Keep exactly the columns used at fit-time:
+        exog_cols = [c for c in train_df.columns if c not in ("ds", "y")]
+        df_fit_cols = ["ds", "y"] + exog_cols
+        df_fit = train_df[df_fit_cols].copy()
+
+        # Build the future timestamp index (UTC) for the forecast horizon
         fut_idx = pd.date_range(
             start=last_ts + timedelta(minutes=interval_min),
             periods=steps,
@@ -1251,19 +1259,21 @@ async def run_sensor_job(sensor: SensorCfg,
             tz="UTC",
         )
 
-        # Build a DataFrame of future regressor values if any were registered at fit-time
+        # Build a DataFrame of future-regressor values (only for the *future* covariates)
         reg_future = None
         if sensor.covariates_future:
-            reg_future = pd.DataFrame({"ds": fut_idx})
-            for cov in sensor.covariates_future:
-                # Get live/known future values for these timestamps
-                s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
-                reg_future[cov] = s.to_numpy()
+            # keep only those future covariate names that were present at fit-time
+            fut_names = [c for c in sensor.covariates_future if c in exog_cols]
+            if fut_names:
+                reg_future = pd.DataFrame({"ds": fut_idx})
+                for cov in fut_names:
+                    s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
+                    reg_future[cov] = s.to_numpy()
 
-        # Ask NP to construct a pure-future frame; pass the future regressors
-        # Keep only ['ds','y'] from training; NP knows which regressors exist from fit()
+        # Ask NP to construct a pure-future frame; pass the same columns used at fit-time,
+        # and, when supported, the explicit future-regressors for the future window.
         df_future = backend.make_future(
-            train_df[["ds", "y"]],
+            df_fit,
             periods=steps,
             historic=False,
             future_regressors=reg_future,
@@ -1286,7 +1296,7 @@ async def run_sensor_job(sensor: SensorCfg,
         if log_applied:
             yhat_int = invert_log_transform(yhat_int, True)
 
-        # Future timestamps are exactly the fut_idx we constructed
+        # Future timestamps are exactly the fut_idx constructed above
         ds_future = [ts.to_pydatetime() for ts in fut_idx]
 
         metrics = {"training_rows": int(len(train_df)), "mae_recent": None}
