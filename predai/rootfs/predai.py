@@ -742,7 +742,7 @@ class NPBackend:
         )
         if learning_rate is not None:
             kw["learning_rate"] = learning_rate
-        self.model = NeuralProphet(**kw, drop_missing=True)
+        self.model = NeuralProphet(**kw)
         if country:
             self.model.add_country_holidays(country)
         self.fitted = False
