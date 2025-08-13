@@ -742,7 +742,7 @@ class NPBackend:
         )
         if learning_rate is not None:
             kw["learning_rate"] = learning_rate
-        self.model = NeuralProphet(**kw)
+        self.model = NeuralProphet(**kw, drop_missing=True)
         if country:
             self.model.add_country_holidays(country)
         self.fitted = False
@@ -1261,8 +1261,17 @@ async def run_sensor_job(sensor: SensorCfg,
             if cov not in train_df.columns:
                 train_df[cov] = 0.0
         if cov_cols:
-            train_df[cov_cols] = train_df[cov_cols].fillna(method="ffill")
+            # Forward-fill then back-fill
+            train_df[cov_cols] = train_df[cov_cols].ffill().bfill()
+            # If any NAs remain (e.g., covariate starts late), fill with column medians
+            if train_df[cov_cols].isna().any().any():
+                med = train_df[cov_cols].median(numeric_only=True)
+                train_df[cov_cols] = train_df[cov_cols].fillna(med)
+            # Final safety net
             train_df[cov_cols] = train_df[cov_cols].fillna(0.0)
+
+        # Log a summary after imputation
+        summarise_df(f"train_imputed.{sensor.name}", train_df)
 
         # Fit
         backend.fit(train_df, freq=freq)
@@ -1315,6 +1324,7 @@ async def run_sensor_job(sensor: SensorCfg,
         # Some NP builds omit 'y' on future-only frames; add it if missing
         if "y" not in df_future.columns:
             df_future["y"] = np.nan
+        df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
         summarise_df(f"future.{sensor.name}", df_future)
         # Predict
         fcst = backend.predict(df_future)
