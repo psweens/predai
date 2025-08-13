@@ -72,6 +72,31 @@ if not logger.handlers:
     h.setFormatter(fmt)
     logger.addHandler(h)
 logger.setLevel(logging.DEBUG)
+# ---- PredAI logging helpers ----
+def summarise_series(name: str, s: pd.Series):
+    try:
+        size = int(s.shape[0])
+        nans = int(s.isna().sum())
+        s_clean = s.dropna()
+        vmin = float(s_clean.min()) if not s_clean.empty else None
+        vmax = float(s_clean.max()) if not s_clean.empty else None
+        logger.info("Summary %s: size=%s NaNs=%s min=%s max=%s", name, size, nans, vmin, vmax)
+    except Exception as e:
+        logger.warning("Summary failed for %s: %s", name, e)
+
+def summarise_df(tag: str, df: pd.DataFrame):
+    try:
+        logger.info("DF %s: shape=%s cols=%s", tag, df.shape, list(df.columns))
+        if "ds" in df.columns and not df.empty:
+            logger.info("DF %s time span: %s -> %s", tag, df["ds"].min(), df["ds"].max())
+        for c in df.columns:
+            if c == "ds":
+                continue
+            summarise_series(f"{tag}.{c}", df[c])
+    except Exception as e:
+        logger.warning("DF summary failed for %s: %s", tag, e)
+# ---- end helpers ----
+
 
 # --------------------------------------------------------------------------- #
 # Utility: timestamps
@@ -167,6 +192,7 @@ class SensorCfg:
 
     covariates_future: List[str] = field(default_factory=list)
     covariates_lagged: List[str] = field(default_factory=list)
+    covariates_both: List[str] = field(default_factory=list)
 
     n_lags: Optional[int] = None
     seasonality_reg: Optional[float] = None
@@ -283,8 +309,9 @@ def _load_sensor(dflt: Dict[str, Any], d: Dict[str, Any]) -> SensorCfg:
         publish_interval=merged.get("publish_interval", True),
         publish_cumulative=merged.get("publish_cumulative", True),
         publish_daily_cumulative=merged.get("publish_daily_cumulative", True),
-        covariates_future=merged.get("covariates_future", []) or [],
-        covariates_lagged=merged.get("covariates_lagged", []) or [],
+        covariates_future=(merged.get("covariates_future") or merged.get("future") or []),
+        covariates_lagged=(merged.get("covariates_lagged") or merged.get("lagged") or []),
+        covariates_both=(merged.get("covariates_both") or merged.get("lagged_future") or []),
         n_lags=merged.get("n_lags"),
         seasonality_reg=merged.get("seasonality_reg"),
         seasonality_mode=merged.get("seasonality_mode"),
@@ -772,6 +799,11 @@ def make_entity_name(prefix: str, base: str, suffix: Optional[str] = None) -> st
         parts.append(str(suffix))
     object_id = "_".join(parts)
     object_id = re.sub(r"_+", "_", object_id).strip("_")
+        # Ensure PredAI prefix applied exactly once
+    if not object_id.startswith("predai_"):
+        object_id = "predai_" + object_id
+    object_id = re.sub(r"^predai_predai_", "predai_", object_id)
+    object_id = re.sub(r"_+", "_", object_id)
     return f"sensor.{object_id}"
 
 
@@ -1175,6 +1207,7 @@ async def run_sensor_job(sensor: SensorCfg,
     logger.info(
         "Sensor %s: training frame %s rows", sensor.name, len(train_df)
     )
+    summarise_df(f"train.{sensor.name}", train_df)
     if not train_df.empty:
         logger.info(
             "Sensor %s: training min=%s max=%s %s",
@@ -1197,8 +1230,8 @@ async def run_sensor_job(sensor: SensorCfg,
             country=sensor.country,
         )
 
-        # lagged covariates
-        for cov in sensor.covariates_lagged:
+        # lagged covariates (including both)
+        for cov in list(dict.fromkeys(list(sensor.covariates_lagged) + list(sensor.covariates_both))):
             s = await cov_res.get_hist_series(cov, start_hist, end_hist, freq, agg)
             if not s.empty:
                 train_df = train_df.merge(s.rename(cov), left_on="ds", right_index=True, how="left")
@@ -1209,8 +1242,8 @@ async def run_sensor_job(sensor: SensorCfg,
             else:
                 logger.debug("Covariate %s lagged: no history.", cov)
 
-        # future covariates
-        for cov in sensor.covariates_future:
+        # future covariates (including both)
+        for cov in list(dict.fromkeys(list(sensor.covariates_future) + list(sensor.covariates_both))):
             s = await cov_res.get_hist_series(cov, start_hist, end_hist, freq, agg)
             if not s.empty:
                 train_df = train_df.merge(s.rename(cov), left_on="ds", right_index=True, how="left")
@@ -1223,13 +1256,22 @@ async def run_sensor_job(sensor: SensorCfg,
             backend.add_future_regressor(cov, mode="additive")
 
         # ensure regressor columns exist even if HA returned no history
-        cov_cols = sensor.covariates_lagged + sensor.covariates_future
+        cov_cols = list(dict.fromkeys(list(sensor.covariates_lagged) + list(sensor.covariates_future) + list(sensor.covariates_both)))
         for cov in cov_cols:
             if cov not in train_df.columns:
                 train_df[cov] = 0.0
         if cov_cols:
-            train_df[cov_cols] = train_df[cov_cols].fillna(method="ffill")
+            # Forward-fill then back-fill
+            train_df[cov_cols] = train_df[cov_cols].ffill().bfill()
+            # If any NAs remain (e.g., covariate starts late), fill with column medians
+            if train_df[cov_cols].isna().any().any():
+                med = train_df[cov_cols].median(numeric_only=True)
+                train_df[cov_cols] = train_df[cov_cols].fillna(med)
+            # Final safety net
             train_df[cov_cols] = train_df[cov_cols].fillna(0.0)
+
+        # Log a summary after imputation
+        summarise_df(f"train_imputed.{sensor.name}", train_df)
 
         # Fit
         backend.fit(train_df, freq=freq)
@@ -1263,7 +1305,7 @@ async def run_sensor_job(sensor: SensorCfg,
         reg_future = None
         if sensor.covariates_future:
             # keep only those future covariate names that were present at fit-time
-            fut_names = [c for c in sensor.covariates_future if c in exog_cols]
+            fut_names = [c for c in (list(sensor.covariates_future) + list(sensor.covariates_both)) if c in exog_cols]
             if fut_names:
                 reg_future = pd.DataFrame({"ds": fut_idx})
                 for cov in fut_names:
@@ -1282,16 +1324,37 @@ async def run_sensor_job(sensor: SensorCfg,
         # Some NP builds omit 'y' on future-only frames; add it if missing
         if "y" not in df_future.columns:
             df_future["y"] = np.nan
-
-        # Predict
-        fcst = backend.predict(df_future)
+        df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
+        summarise_df(f"future.{sensor.name}", df_future)
+        # Predict with fallback for NP length-mismatch
+        try:
+            fcst = backend.predict(df_future)
+        except ValueError as e:
+            logger.warning("Predict failed (%s). Retrying with n_historic_predictions=True to avoid NP reshape bug.", e)
+            df_future = backend.make_future(
+                df_fit,
+                periods=steps,
+                historic=True,
+                future_regressors=reg_future,
+            )
+            if "y" not in df_future.columns:
+                df_future["y"] = np.nan
+            df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
+            summarise_df(f"future_fallback.{sensor.name}", df_future)
+            fcst = backend.predict(df_future)
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
+        summarise_df(f"forecast.{sensor.name}", fcst)
 
-        # With n_historic_predictions=False, the first future row carries yhat1..yhatN
-        first_future = fcst.iloc[0]
-        yhat_cols = sorted([c for c in first_future.index if c.startswith("yhat")],
-                           key=lambda s: int(s[4:]))
-
+        # Find the first row whose yhat1..N are all non-NaN
+        yhat_cols = sorted([c for c in fcst.columns if c.startswith("yhat")], key=lambda s: int(s[4:]))
+        if not yhat_cols:
+            raise RuntimeError("No yhat columns present in forecast output")
+        mask_complete = fcst[yhat_cols].notna().all(axis=1)
+        if mask_complete.any():
+            first_future = fcst.loc[mask_complete].iloc[0]
+        else:
+            # fall back to last row; some NP versions only fill at the end
+            first_future = fcst.iloc[-1]
         yhat_int = first_future[yhat_cols].to_numpy()
         if log_applied:
             yhat_int = invert_log_transform(yhat_int, True)
