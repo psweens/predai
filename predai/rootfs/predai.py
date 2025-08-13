@@ -730,7 +730,7 @@ class NPBackend:
         self.model.fit(df, freq=freq, progress=None)
         self.fitted = True
 
-    def make_future(self, df: pd.DataFrame, periods: int, historic: bool = False) -> pd.DataFrame:
+    def make_future(self, df: pd.DataFrame, periods: int, historic: bool = True) -> pd.DataFrame:
         return self.model.make_future_dataframe(df, n_historic_predictions=historic, periods=periods)
 
     def predict(self, df_future: pd.DataFrame) -> pd.DataFrame:
@@ -1230,43 +1230,78 @@ async def run_sensor_job(sensor: SensorCfg,
             horizon_steps(m, interval_min) for m in cfg.horizons
         )
 
-        # --- Build a future-only frame of exactly `steps` rows ---
-        df_future = backend.make_future(train_df, periods=steps, historic=False)
+        # --- Build a history+future frame and provide regressors explicitly ---
+        last_ts = train_df["ds"].max()
+
+        # Ask NP to append `steps` future rows AFTER history
+        df_future = backend.make_future(train_df, periods=steps, historic=True)
         df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
 
-        # Use only FUTURE regressors the model was trained with; NP derives lagged regs internally
-        future_regressors = [c for c in sensor.covariates_future if c in train_df.columns]
+        # Merge back the training columns (so history rows carry y + lagged regs)
+        expected = list(train_df.columns)   # ['ds','y', <lagged...>, <future...>]
+        df_future = df_future.merge(train_df[expected], on="ds", how="left")
 
-        # Populate future regressors with live values for those timestamps
-        if future_regressors:
-            fut_idx = df_future["ds"]
+        # Identify future rows
+        fut_mask = df_future["ds"] > last_ts
+        fut_idx = df_future.loc[fut_mask, "ds"]
+
+        # Ensure there is a 'y' column (needed by some NP versions)
+        if "y" not in df_future.columns:
+            df_future["y"] = np.nan
+        # Seed future 'y' with the last observed value (ignored by NP during predict but required)
+        if not train_df["y"].empty:
+            df_future.loc[fut_mask, "y"] = train_df["y"].iloc[-1]
+
+        # Populate FUTURE regressors for future rows with live values
+        future_regressors = [c for c in sensor.covariates_future if c in expected]
+        if future_regressors and len(fut_idx) > 0:
             for cov in future_regressors:
                 s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
-                df_future[cov] = s.to_numpy()
+                df_future.loc[fut_mask, cov] = s.to_numpy()
 
-        # Some NP builds don't want 'y' in future-only frames
-        if "y" in df_future.columns:
-            df_future = df_future.drop(columns=["y"])
+        # For LAGGED regressors, keep the last observed value for future rows
+        for cov in sensor.covariates_lagged:
+            if cov in expected:
+                last_val = train_df[cov].iloc[-1] if cov in train_df.columns else 0.0
+                df_future.loc[fut_mask, cov] = 0.0 if pd.isna(last_val) else last_val
 
-        # Final clean
-        if future_regressors:
-            df_future[future_regressors] = df_future[future_regressors].ffill().fillna(0.0)
-
-        # Keep only ds + the future regressors
-        keep_cols = ["ds"] + future_regressors
+        # Clean NaNs (history first, then future); keep only ds + expected columns
+        keep_cols = ["ds"] + [c for c in expected if c != "ds"]
+        for col in keep_cols:
+            if col not in df_future.columns:
+                df_future[col] = 0.0
         df_future = df_future[keep_cols]
+        df_future[keep_cols[1:]] = df_future[keep_cols[1:]].ffill().fillna(0.0)
+
+        # Deduplicate & sort
+        df_future = df_future.sort_values("ds").drop_duplicates(subset=["ds"], keep="last")
+
+        # Tail to (max_lags + steps) rows to avoid NP reshape mismatch
+        try:
+            max_lags = int(getattr(backend.model, "max_lags", 0))
+        except Exception:
+            max_lags = sensor.effective_n_lags(role_cfg) or 0
+        keep = max(steps + max_lags, steps)
+        df_future = df_future.tail(keep)
 
         # 5.  Predict.
         fcst = backend.predict(df_future)
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
 
-        # 6.  Future-only: yhat1 down the rows is the next-interval sequence
-        yhat_int = fcst["yhat1"].to_numpy()
+        # 6.  Take the forecast vector from the last historic row
+        row_mask = fcst["ds"] == last_ts
+        if not row_mask.any():              # fallback: last row of frame
+            row_mask = fcst.index == (len(fcst) - 1)
+        last_row = fcst.loc[row_mask].iloc[0]
+        yhat_cols = sorted([c for c in last_row.index if c.startswith("yhat")],
+                           key=lambda s: int(s[4:]))
+        yhat_int = last_row[yhat_cols].to_numpy()
 
         if log_applied:
             yhat_int = invert_log_transform(yhat_int, True)
 
-        ds_future = list(df_future["ds"])[:steps]
+        # Future timestamps are the next `steps` buckets after last_ts
+        ds_future = [last_ts + timedelta(minutes=interval_min * i) for i in range(1, steps + 1)]
 
         metrics = {"training_rows": int(len(train_df)), "mae_recent": None}
         await publish_forecasts(sensor, role_cfg, iface, cfg, ds_future, yhat_int,
