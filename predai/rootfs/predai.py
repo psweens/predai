@@ -1326,16 +1326,35 @@ async def run_sensor_job(sensor: SensorCfg,
             df_future["y"] = np.nan
         df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
         summarise_df(f"future.{sensor.name}", df_future)
-        # Predict
-        fcst = backend.predict(df_future)
+        # Predict with fallback for NP length-mismatch
+        try:
+            fcst = backend.predict(df_future)
+        except ValueError as e:
+            logger.warning("Predict failed (%s). Retrying with n_historic_predictions=True to avoid NP reshape bug.", e)
+            df_future = backend.make_future(
+                df_fit,
+                periods=steps,
+                historic=True,
+                future_regressors=reg_future,
+            )
+            if "y" not in df_future.columns:
+                df_future["y"] = np.nan
+            df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
+            summarise_df(f"future_fallback.{sensor.name}", df_future)
+            fcst = backend.predict(df_future)
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
         summarise_df(f"forecast.{sensor.name}", fcst)
 
-        # With n_historic_predictions=False, the first future row carries yhat1..yhatN
-        first_future = fcst.iloc[0]
-        yhat_cols = sorted([c for c in first_future.index if c.startswith("yhat")],
-                           key=lambda s: int(s[4:]))
-
+        # Find the first row whose yhat1..N are all non-NaN
+        yhat_cols = sorted([c for c in fcst.columns if c.startswith("yhat")], key=lambda s: int(s[4:]))
+        if not yhat_cols:
+            raise RuntimeError("No yhat columns present in forecast output")
+        mask_complete = fcst[yhat_cols].notna().all(axis=1)
+        if mask_complete.any():
+            first_future = fcst.loc[mask_complete].iloc[0]
+        else:
+            # fall back to last row; some NP versions only fill at the end
+            first_future = fcst.iloc[-1]
         yhat_int = first_future[yhat_cols].to_numpy()
         if log_applied:
             yhat_int = invert_log_transform(yhat_int, True)
