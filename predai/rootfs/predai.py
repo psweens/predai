@@ -1321,37 +1321,27 @@ async def run_sensor_job(sensor: SensorCfg,
             future_regressors=reg_future,
         )
 
-    # Keep only the pure-future rows so forecast index == number of future steps
-    first_future = last_ts + timedelta(minutes=interval_min)
-    if "y" not in df_future.columns:
-        df_future["y"] = np.nan  # ensure column exists
-    df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
-    df_future = df_future[df_future["ds"] >= first_future].copy()
-    # Keep exactly the fit-time columns (ds,y + exog), in case NP added extras
-    df_future = df_future[["ds", "y"] + [c for c in exog_cols if c in df_future.columns]]
-    summarise_df(f"future.{sensor.name}", df_future)
-    
-    # Predict with fallback for NP length-mismatch
-    try:
-        fcst = backend.predict(df_future)
-    except ValueError as e:
-        logger.warning(
-            "Predict failed (%s). Retrying with n_historic_predictions=True and pure-future slice.",
-            e,
-        )
-        # Rebuild without future_regressors; use historic=True and slice to pure future again
-        df_future_fb = backend.make_future(
-            df_fit,
-            periods=steps,
-            historic=True,
-        )
-        if "y" not in df_future_fb.columns:
-            df_future_fb["y"] = np.nan
-        df_future_fb["ds"] = pd.to_datetime(df_future_fb["ds"], utc=True)
-        df_future_fb = df_future_fb[df_future_fb["ds"] >= first_future].copy()
-        df_future_fb = df_future_fb[["ds", "y"] + [c for c in exog_cols if c in df_future_fb.columns]]
-        summarise_df(f"future_fallback.{sensor.name}", df_future_fb)
-        fcst = backend.predict(df_future_fb)
+        # Some NP builds omit 'y' on future-only frames; add it if missing
+        if "y" not in df_future.columns:
+            df_future["y"] = np.nan
+        df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
+        summarise_df(f"future.{sensor.name}", df_future)
+        # Predict with fallback for NP length-mismatch
+        try:
+            fcst = backend.predict(df_future)
+        except ValueError as e:
+            logger.warning("Predict failed (%s). Retrying with n_historic_predictions=True to avoid NP reshape bug.", e)
+            df_future = backend.make_future(
+                df_fit,
+                periods=steps,
+                historic=True,
+                future_regressors=reg_future,
+            )
+            if "y" not in df_future.columns:
+                df_future["y"] = np.nan
+            df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
+            summarise_df(f"future_fallback.{sensor.name}", df_future)
+            fcst = backend.predict(df_future)
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
         summarise_df(f"forecast.{sensor.name}", fcst)
 
