@@ -525,14 +525,43 @@ class HistoryDB:
 # Transform utilities
 # --------------------------------------------------------------------------- #
 
-def normalise_history(raw: List[dict]) -> pd.DataFrame:
+        return 1.0
+    if s in falsy:
+        return 0.0
+
+    # Try numeric strings ("0", "1", "0.0", etc.)
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def normalise_history(raw: list[dict]) -> pd.DataFrame:
     logger.debug("Normalising history with %s raw rows", len(raw))
     if not raw:
         return pd.DataFrame(columns=["ds", "value"])
+
     df = pd.DataFrame(raw)
-    df["ds"] = pd.to_datetime(df["last_updated"], utc=True, errors="coerce")
-    df["value"] = pd.to_numeric(df["state"], errors="coerce")
+
+    # Prefer 'last_updated', fall back to 'last_changed' if needed
+    ts_col = "last_updated" if "last_updated" in df.columns else (
+        "last_changed" if "last_changed" in df.columns else None
+    )
+    if ts_col is None:
+        # Graceful fallback if upstream shape changes
+        return pd.DataFrame(columns=["ds", "value"])
+
+    df["ds"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+
+    # Map boolean-ish states to floats, else try numeric
+    coerced = df["state"].map(_state_to_float)
+    numeric = pd.to_numeric(df["state"], errors="coerce")
+    df["value"] = coerced.where(coerced.notna(), numeric).astype("float32")
+
+    # De-dupe & sort
     df = df.dropna(subset=["ds", "value"]).sort_values("ds")
+    df = df.drop_duplicates(subset=["ds"], keep="last")
+
     logger.debug("Normalised history result rows=%s", len(df))
     return df[["ds", "value"]]
 
@@ -619,7 +648,32 @@ def subtract_set(base: pd.DataFrame, sub: pd.DataFrame, *, inc: bool = False) ->
     )
     return merged[["ds", "y"]]
 
+def _state_to_float(x) -> float | None:
+    # Handle real booleans fast
+    if isinstance(x, bool):
+        return 1.0 if x else 0.0
+    if x is None:
+        return None
 
+    s = str(x).strip().lower()
+    # Explicit NA-ish states from HA
+    if s in {"unknown", "unavailable", "none", "nan"}:
+        return None
+
+    # Common boolean-ish labels
+    truthy = {"on", "true", "open", "home", "detected", "motion", "active", "present"}
+    falsy  = {"off", "false", "closed", "not_home", "clear", "no_motion", "inactive", "absent"}
+
+    if s in truthy:
+        return 1.0
+    if s in falsy:
+        return 0.0
+
+    # Try numeric strings (e.g. "0", "1")
+    try:
+        return float(s)
+    except Exception:
+        return None
 # --------------------------------------------------------------------------- #
 # CovariateResolver
 # --------------------------------------------------------------------------- #
