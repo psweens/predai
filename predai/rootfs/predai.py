@@ -697,41 +697,41 @@ class CovariateResolver:
         return out
 
     async def get_future_series(self, cov_name: str, future_index: pd.DatetimeIndex, default: float = 0.0) -> pd.Series:
-    meta = self._resolve(cov_name)
-    entity_id = meta["entity"]
-    scale = float(meta.get("scale", 1.0))
-    attr_name = meta.get("forecast_attr")
-
-    # If no forecast attribute is configured, fall back to current-state constant
-    if not attr_name:
-        val = await self.iface.get_state(entity_id)
-        try:
-            v = float(val) * scale
-        except (TypeError, ValueError):
-            v = float(default)
-        return pd.Series(v, index=future_index)
-
-    # 1) Fetch future series payload from HA
-    payload = await self.iface.get_state(entity_id, attribute=attr_name) or []
-
-    # 2) Normalise: handle both point forecasts and [start, end) intervals
-    df = pd.DataFrame(payload)
-
-    # Common field names seen in HA forecasts
-    time_keys_point = [k for k in ["time", "datetime", "date", "at"] if k in df.columns]
-    start_keys = [k for k in ["valid_from", "start", "from"] if k in df.columns]
-    end_keys   = [k for k in ["valid_to", "end", "to", "until"] if k in df.columns]
-
-    # Heuristic: pick the first numeric column as the value if not obviously named
-    value_col_candidates = [c for c in df.columns if c.lower() in {"value", "price", "temperature", "temp", "y"}]
-    if value_col_candidates:
-        val_col = value_col_candidates[0]
-    else:
-        val_col = next((c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])), None)
-
-    if val_col is None:
-        # Nothing numeric -> fill defaults
-        return pd.Series(float(default), index=future_index)
+        meta = self._resolve(cov_name)
+        entity_id = meta["entity"]
+        scale = float(meta.get("scale", 1.0))
+        attr_name = meta.get("forecast_attr")
+    
+        # If no forecast attribute is configured, fall back to current-state constant
+        if not attr_name:
+            val = await self.iface.get_state(entity_id)
+            try:
+                v = float(val) * scale
+            except (TypeError, ValueError):
+                v = float(default)
+            return pd.Series(v, index=future_index)
+    
+        # 1) Fetch future series payload from HA
+        payload = await self.iface.get_state(entity_id, attribute=attr_name) or []
+    
+        # 2) Normalise: handle both point forecasts and [start, end) intervals
+        df = pd.DataFrame(payload)
+    
+        # Common field names seen in HA forecasts
+        time_keys_point = [k for k in ["time", "datetime", "date", "at"] if k in df.columns]
+        start_keys = [k for k in ["valid_from", "start", "from"] if k in df.columns]
+        end_keys   = [k for k in ["valid_to", "end", "to", "until"] if k in df.columns]
+    
+        # Heuristic: pick the first numeric column as the value if not obviously named
+        value_col_candidates = [c for c in df.columns if c.lower() in {"value", "price", "temperature", "temp", "y"}]
+        if value_col_candidates:
+            val_col = value_col_candidates[0]
+        else:
+            val_col = next((c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])), None)
+    
+        if val_col is None:
+            # Nothing numeric -> fill defaults
+            return pd.Series(float(default), index=future_index)
 
     # Convert the model’s index to a DataFrame for joining
     target = pd.DataFrame({"ds": pd.to_datetime(future_index, utc=True)}).sort_values("ds")
