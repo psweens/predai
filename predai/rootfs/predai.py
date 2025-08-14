@@ -697,27 +697,84 @@ class CovariateResolver:
         return out
 
     async def get_future_series(self, cov_name: str, future_index: pd.DatetimeIndex, default: float = 0.0) -> pd.Series:
-        meta = self._resolve(cov_name)
-        entity_id = meta["entity"]
+    meta = self._resolve(cov_name)
+    entity_id = meta["entity"]
+    scale = float(meta.get("scale", 1.0))
+    attr_name = meta.get("forecast_attr")
+
+    # If no forecast attribute is configured, fall back to current-state constant
+    if not attr_name:
         val = await self.iface.get_state(entity_id)
         try:
-            v = float(val) * meta.get("scale", 1.0)
+            v = float(val) * scale
         except (TypeError, ValueError):
-            v = default
-        logger.debug(
-            "Covariate %s: future value %s from %s", cov_name, v, entity_id
-        )
-        logger.debug(
-            "Covariate %s: future series len=%s", cov_name, len(future_index)
-        )
-        logger.info(
-            "Covariate %s future: min=%s max=%s %s",
-            cov_name,
-            v,
-            v,
-            meta.get("units", ""),
-        )
+            v = float(default)
         return pd.Series(v, index=future_index)
+
+    # 1) Fetch future series payload from HA
+    payload = await self.iface.get_state(entity_id, attribute=attr_name) or []
+
+    # 2) Normalise: handle both point forecasts and [start, end) intervals
+    df = pd.DataFrame(payload)
+
+    # Common field names seen in HA forecasts
+    time_keys_point = [k for k in ["time", "datetime", "date", "at"] if k in df.columns]
+    start_keys = [k for k in ["valid_from", "start", "from"] if k in df.columns]
+    end_keys   = [k for k in ["valid_to", "end", "to", "until"] if k in df.columns]
+
+    # Heuristic: pick the first numeric column as the value if not obviously named
+    value_col_candidates = [c for c in df.columns if c.lower() in {"value", "price", "temperature", "temp", "y"}]
+    if value_col_candidates:
+        val_col = value_col_candidates[0]
+    else:
+        val_col = next((c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])), None)
+
+    if val_col is None:
+        # Nothing numeric -> fill defaults
+        return pd.Series(float(default), index=future_index)
+
+    # Convert the model’s index to a DataFrame for joining
+    target = pd.DataFrame({"ds": pd.to_datetime(future_index, utc=True)}).sort_values("ds")
+
+    if time_keys_point:
+        # --- Point forecasts: nearest-time match with a sensible tolerance ---
+        dfp = df[[time_keys_point[0], val_col]].rename(columns={time_keys_point[0]: "ds", val_col: "value"})
+        dfp["ds"] = pd.to_datetime(dfp["ds"], utc=True, errors="coerce")
+        dfp = dfp.dropna(subset=["ds"]).sort_values("ds")
+        # Tolerance: half the median step in target index
+        if len(target) >= 2:
+            step = (target["ds"].diff().dropna().median()) or pd.Timedelta("30min")
+        else:
+            step = pd.Timedelta("30min")
+        out = pd.merge_asof(target, dfp, on="ds", direction="nearest", tolerance=step)["value"]
+
+    elif start_keys and end_keys:
+        # --- Interval forecasts: expand intervals to target slots they cover ---
+        start_col, end_col = start_keys[0], end_keys[0]
+        dfi = df[[start_col, end_col, val_col]].rename(
+            columns={start_col: "start", end_col: "end", val_col: "value"}
+        )
+        dfi["start"] = pd.to_datetime(dfi["start"], utc=True, errors="coerce")
+        dfi["end"]   = pd.to_datetime(dfi["end"],   utc=True, errors="coerce")
+        dfi = dfi.dropna(subset=["start", "end"]).sort_values("start")
+
+        # For each target ds, take the value from the interval where start <= ds < end
+        # Vectorised: join-on-condition via merge_asof on start, then mask by end
+        tmp = pd.merge_asof(target, dfi[["start", "end", "value"]], left_on="ds", right_on="start", direction="backward")
+        mask = tmp["ds"].lt(tmp["end"])
+        out = tmp["value"].where(mask)
+
+    else:
+        # Unknown shape: just fill default
+        out = pd.Series(float(default), index=target.index)
+
+    # 3) Scale, fill gaps deterministically, and return with the original index
+    s = pd.to_numeric(out, errors="coerce") * scale
+    # Fill any missing values (choose policy to taste)
+    s = s.ffill().fillna(float(default))
+    s.index = future_index  # ensure identical index object
+    return s
+
 
 
 # --------------------------------------------------------------------------- #
@@ -1293,33 +1350,42 @@ async def run_sensor_job(sensor: SensorCfg,
         df_fit_cols = ["ds", "y"] + exog_cols
         df_fit = train_df[df_fit_cols].copy()
 
-        # Build the future timestamp index (UTC) for the forecast horizon
-        fut_idx = pd.date_range(
-            start=last_ts + timedelta(minutes=interval_min),
+       # --- Stage 1: ask NP for the future frame without regressors ---
+        probe = backend.make_future(
+            df_fit,
             periods=steps,
-            freq=f"{interval_min}min",
-            tz="UTC",
+            historic=False,
+            future_regressors=None
         )
-
-        # Build a DataFrame of future-regressor values (only for the *future* covariates)
+        probe["ds"] = pd.to_datetime(probe["ds"], utc=True)
+        
+        # --- Build future regressors aligned to the model's ds grid ---
         reg_future = None
         if sensor.covariates_future:
-            # keep only those future covariate names that were present at fit-time
             fut_names = [c for c in (list(sensor.covariates_future) + list(sensor.covariates_both)) if c in exog_cols]
             if fut_names:
-                reg_future = pd.DataFrame({"ds": fut_idx})
+                ds_grid = probe["ds"]  # The model’s exact future timestamps
+                reg_future = pd.DataFrame({"ds": ds_grid})
                 for cov in fut_names:
-                    s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
+                    s = await cov_res.get_future_series(cov, ds_grid, default=0.0)
                     reg_future[cov] = s.to_numpy()
-
-        # Ask NP to construct a pure-future frame; pass the same columns used at fit-time,
-        # and, when supported, the explicit future-regressors for the future window.
+        
+        # --- Stage 2: re-make the future frame with aligned regressors ---
         df_future = backend.make_future(
             df_fit,
             periods=steps,
             historic=False,
-            future_regressors=reg_future,
+            future_regressors=reg_future
         )
+        if "y" not in df_future.columns:
+            df_future["y"] = np.nan
+        df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
+        
+        # --- Optional: sanity check ---
+        if reg_future is not None:
+            assert len(reg_future) == len(df_future), \
+                f"Regressor rows {len(reg_future)} != future frame rows {len(df_future)}"
+
 
         # Some NP builds omit 'y' on future-only frames; add it if missing
         if "y" not in df_future.columns:
