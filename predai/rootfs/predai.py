@@ -733,49 +733,47 @@ class CovariateResolver:
             # Nothing numeric -> fill defaults
             return pd.Series(float(default), index=future_index)
 
-    # Convert the model’s index to a DataFrame for joining
-    target = pd.DataFrame({"ds": pd.to_datetime(future_index, utc=True)}).sort_values("ds")
-
-    if time_keys_point:
-        # --- Point forecasts: nearest-time match with a sensible tolerance ---
-        dfp = df[[time_keys_point[0], val_col]].rename(columns={time_keys_point[0]: "ds", val_col: "value"})
-        dfp["ds"] = pd.to_datetime(dfp["ds"], utc=True, errors="coerce")
-        dfp = dfp.dropna(subset=["ds"]).sort_values("ds")
-        # Tolerance: half the median step in target index
-        if len(target) >= 2:
-            step = (target["ds"].diff().dropna().median()) or pd.Timedelta("30min")
+        # Convert the model’s index to a DataFrame for joining
+        target = pd.DataFrame({"ds": pd.to_datetime(future_index, utc=True)}).sort_values("ds")
+    
+        if time_keys_point:
+            # --- Point forecasts: nearest-time match with a sensible tolerance ---
+            dfp = df[[time_keys_point[0], val_col]].rename(columns={time_keys_point[0]: "ds", val_col: "value"})
+            dfp["ds"] = pd.to_datetime(dfp["ds"], utc=True, errors="coerce")
+            dfp = dfp.dropna(subset=["ds"]).sort_values("ds")
+            # Tolerance: half the median step in target index
+            if len(target) >= 2:
+                step = (target["ds"].diff().dropna().median()) or pd.Timedelta("30min")
+            else:
+                step = pd.Timedelta("30min")
+            out = pd.merge_asof(target, dfp, on="ds", direction="nearest", tolerance=step)["value"]
+    
+        elif start_keys and end_keys:
+            # --- Interval forecasts: expand intervals to target slots they cover ---
+            start_col, end_col = start_keys[0], end_keys[0]
+            dfi = df[[start_col, end_col, val_col]].rename(
+                columns={start_col: "start", end_col: "end", val_col: "value"}
+            )
+            dfi["start"] = pd.to_datetime(dfi["start"], utc=True, errors="coerce")
+            dfi["end"]   = pd.to_datetime(dfi["end"],   utc=True, errors="coerce")
+            dfi = dfi.dropna(subset=["start", "end"]).sort_values("start")
+    
+            # For each target ds, take the value from the interval where start <= ds < end
+            # Vectorised: join-on-condition via merge_asof on start, then mask by end
+            tmp = pd.merge_asof(target, dfi[["start", "end", "value"]], left_on="ds", right_on="start", direction="backward")
+            mask = tmp["ds"].lt(tmp["end"])
+            out = tmp["value"].where(mask)
+    
         else:
-            step = pd.Timedelta("30min")
-        out = pd.merge_asof(target, dfp, on="ds", direction="nearest", tolerance=step)["value"]
-
-    elif start_keys and end_keys:
-        # --- Interval forecasts: expand intervals to target slots they cover ---
-        start_col, end_col = start_keys[0], end_keys[0]
-        dfi = df[[start_col, end_col, val_col]].rename(
-            columns={start_col: "start", end_col: "end", val_col: "value"}
-        )
-        dfi["start"] = pd.to_datetime(dfi["start"], utc=True, errors="coerce")
-        dfi["end"]   = pd.to_datetime(dfi["end"],   utc=True, errors="coerce")
-        dfi = dfi.dropna(subset=["start", "end"]).sort_values("start")
-
-        # For each target ds, take the value from the interval where start <= ds < end
-        # Vectorised: join-on-condition via merge_asof on start, then mask by end
-        tmp = pd.merge_asof(target, dfi[["start", "end", "value"]], left_on="ds", right_on="start", direction="backward")
-        mask = tmp["ds"].lt(tmp["end"])
-        out = tmp["value"].where(mask)
-
-    else:
-        # Unknown shape: just fill default
-        out = pd.Series(float(default), index=target.index)
-
-    # 3) Scale, fill gaps deterministically, and return with the original index
-    s = pd.to_numeric(out, errors="coerce") * scale
-    # Fill any missing values (choose policy to taste)
-    s = s.ffill().fillna(float(default))
-    s.index = future_index  # ensure identical index object
-    return s
-
-
+            # Unknown shape: just fill default
+            out = pd.Series(float(default), index=target.index)
+    
+        # 3) Scale, fill gaps deterministically, and return with the original index
+        s = pd.to_numeric(out, errors="coerce") * scale
+        # Fill any missing values (choose policy to taste)
+        s = s.ffill().fillna(float(default))
+        s.index = future_index  # ensure identical index object
+        return s
 
 # --------------------------------------------------------------------------- #
 # Model Backend (NeuralProphet)
