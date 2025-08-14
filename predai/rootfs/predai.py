@@ -1348,42 +1348,41 @@ async def run_sensor_job(sensor: SensorCfg,
         df_fit_cols = ["ds", "y"] + exog_cols
         df_fit = train_df[df_fit_cols].copy()
 
-       # --- Stage 1: ask NP for the future frame without regressors ---
-        probe = backend.make_future(
-            df_fit,
+        # --- Build the model’s future grid ourselves (UTC) ---
+        fut_idx = pd.date_range(
+            start=last_ts,
             periods=steps,
-            historic=False,
-            future_regressors=None
+            freq=freq,
+            inclusive="right",
+            tz=pytz.UTC,
         )
-        probe["ds"] = pd.to_datetime(probe["ds"], utc=True)
         
-        # --- Build future regressors aligned to the model's ds grid ---
+        # --- Build future regressors aligned to that exact grid ---
         reg_future = None
         if sensor.covariates_future:
             fut_names = [c for c in (list(sensor.covariates_future) + list(sensor.covariates_both)) if c in exog_cols]
             if fut_names:
-                ds_grid = probe["ds"]  # The model’s exact future timestamps
-                reg_future = pd.DataFrame({"ds": ds_grid})
+                reg_future = pd.DataFrame({"ds": fut_idx})
                 for cov in fut_names:
-                    s = await cov_res.get_future_series(cov, ds_grid, default=0.0)
+                    s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
                     reg_future[cov] = s.to_numpy()
         
-        # --- Stage 2: re-make the future frame with aligned regressors ---
+        # --- Make the future frame (NP will join future_regressors on 'ds') ---
         df_future = backend.make_future(
             df_fit,
             periods=steps,
             historic=False,
-            future_regressors=reg_future
+            future_regressors=reg_future,
         )
         if "y" not in df_future.columns:
             df_future["y"] = np.nan
         df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
         
-        # --- Optional: sanity check ---
+        # --- Guard: ensure regressor rows match the *future* rows we just asked for ---
         if reg_future is not None:
-            assert len(reg_future) == len(df_future), \
-                f"Regressor rows {len(reg_future)} != future frame rows {len(df_future)}"
-
+            future_rows = (df_future["ds"] > last_ts).sum()
+            assert len(reg_future) == future_rows == len(fut_idx), \
+                f"Future regressor rows={len(reg_future)}; future frame rows={future_rows}; fut_idx={len(fut_idx)}"
 
         # Some NP builds omit 'y' on future-only frames; add it if missing
         if "y" not in df_future.columns:
