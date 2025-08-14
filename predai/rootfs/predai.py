@@ -525,16 +525,32 @@ class HistoryDB:
 # Transform utilities
 # --------------------------------------------------------------------------- #
 
+def _state_to_float(x) -> float | None:
+    # Handle real booleans fast
+    if isinstance(x, bool):
+        return 1.0 if x else 0.0
+    if x is None:
+        return None
+
+    s = str(x).strip().lower()
+    # Explicit NA-ish states from HA
+    if s in {"unknown", "unavailable", "none", "nan"}:
+        return None
+
+    # Common boolean-ish labels
+    truthy = {"on", "true", "open", "home", "detected", "motion", "active", "present"}
+    falsy  = {"off", "false", "closed", "not_home", "clear", "no_motion", "inactive", "absent"}
+
+    if s in truthy:
         return 1.0
     if s in falsy:
         return 0.0
 
-    # Try numeric strings ("0", "1", "0.0", etc.)
+    # Try numeric strings (e.g. "0", "1")
     try:
         return float(s)
     except Exception:
         return None
-
 
 def normalise_history(raw: list[dict]) -> pd.DataFrame:
     logger.debug("Normalising history with %s raw rows", len(raw))
@@ -648,32 +664,6 @@ def subtract_set(base: pd.DataFrame, sub: pd.DataFrame, *, inc: bool = False) ->
     )
     return merged[["ds", "y"]]
 
-def _state_to_float(x) -> float | None:
-    # Handle real booleans fast
-    if isinstance(x, bool):
-        return 1.0 if x else 0.0
-    if x is None:
-        return None
-
-    s = str(x).strip().lower()
-    # Explicit NA-ish states from HA
-    if s in {"unknown", "unavailable", "none", "nan"}:
-        return None
-
-    # Common boolean-ish labels
-    truthy = {"on", "true", "open", "home", "detected", "motion", "active", "present"}
-    falsy  = {"off", "false", "closed", "not_home", "clear", "no_motion", "inactive", "absent"}
-
-    if s in truthy:
-        return 1.0
-    if s in falsy:
-        return 0.0
-
-    # Try numeric strings (e.g. "0", "1")
-    try:
-        return float(s)
-    except Exception:
-        return None
 # --------------------------------------------------------------------------- #
 # CovariateResolver
 # --------------------------------------------------------------------------- #
