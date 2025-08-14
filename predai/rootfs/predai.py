@@ -664,6 +664,23 @@ def subtract_set(base: pd.DataFrame, sub: pd.DataFrame, *, inc: bool = False) ->
     )
     return merged[["ds", "y"]]
 
+def resolve_n_lags(sensor_cfg, role_cfg, train_rows: int, n_forecasts: int) -> int:
+    """
+    Returns the final integer n_lags.
+    - If sensor/model config says 'auto', choose the maximum permissible value
+      so there's at least one training window: len(train_df) - n_forecasts - 1.
+    - Otherwise, coerce to int.
+    """
+    # Prefer sensor override, else role default
+    raw = sensor_cfg.n_lags if sensor_cfg.n_lags is not None else role_cfg.n_lags
+
+    # Accept both int and string; treat 'auto' case-insensitively
+    if isinstance(raw, str) and raw.strip().lower() == "auto":
+        return max(1, int(train_rows) - int(n_forecasts) - 1)
+
+    # Fall back to a normal integer
+    return int(raw)
+
 # --------------------------------------------------------------------------- #
 # CovariateResolver
 # --------------------------------------------------------------------------- #
@@ -1297,10 +1314,6 @@ async def run_sensor_job(sensor: SensorCfg,
         log_applied = True
         logger.debug("Sensor %s: applied log transform", sensor.name)
 
-    if len(df) < role_cfg.n_lags + 5:
-        logger.warning("Sensor %s: insufficient history (%s rows); skipping model.", sensor.name, len(df))
-        return
-
     # Training frame
     train_df = df[["ds", "y"]].copy()
     logger.info(
@@ -1320,8 +1333,25 @@ async def run_sensor_job(sensor: SensorCfg,
         steps = sensor.future_periods if sensor.future_periods is not None else max(
             horizon_steps(m, interval_min) for m in cfg.horizons
         )
+        # Resolve n_lags (supports 'auto')
+        n_lags_eff = resolve_n_lags(sensor, role_cfg, len(train_df), steps)
+        logger.info("Sensor %s: using n_lags=%s (mode=%s)",
+                    sensor.name, n_lags_eff,
+                    "auto" if (isinstance(sensor.n_lags or role_cfg.n_lags, str)
+                               and str(sensor.n_lags or role_cfg.n_lags).lower()=="auto") else "fixed")
+
+        # Now that we know the effective n_lags, do a proper history sufficiency check
+        min_needed = n_lags_eff + steps + 1
+        if len(train_df) < min_needed:
+            logger.warning(
+                "Sensor %s: insufficient history for n_lags=%s & steps=%s "
+                "(have %s rows, need ≥ %s); skipping model.",
+                sensor.name, n_lags_eff, steps, len(train_df), min_needed
+            )
+            return
+
         backend = NPBackend(
-            n_lags=sensor.effective_n_lags(role_cfg),
+            n_lags=n_lags_eff,
             n_forecasts=steps,
             seasonality_reg=sensor.effective_seasonality_reg(role_cfg),
             seasonality_mode=sensor.effective_seasonality_mode(role_cfg),
@@ -1337,7 +1367,7 @@ async def run_sensor_job(sensor: SensorCfg,
                 logger.debug(
                     "Covariate %s lagged: merged %s rows", cov, len(s)
                 )
-                backend.add_lagged_regressor(cov, n_lags=sensor.effective_n_lags(role_cfg))
+                backend.add_lagged_regressor(cov, n_lags=n_lags_eff)
             else:
                 logger.debug("Covariate %s lagged: no history.", cov)
 
