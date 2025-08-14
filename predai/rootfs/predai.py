@@ -1377,6 +1377,18 @@ async def run_sensor_job(sensor: SensorCfg,
         if "y" not in df_future.columns:
             df_future["y"] = np.nan
         df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
+
+        last_needed = fut_idx[-1]
+        overshoot = (df_future["ds"] > last_needed).sum()
+        if overshoot:
+            df_future = df_future[df_future["ds"] <= last_needed]
+
+        # --- Guard: ensure regressor rows match the *future* rows we just asked for ---
+        if reg_future is not None:
+            future_rows = (df_future["ds"] > last_ts).sum()
+            assert len(reg_future) == future_rows == len(fut_idx), \
+                f"Future regressor rows={len(reg_future)}; future frame rows={future_rows}; fut_idx={len(fut_idx)}"
+
         
         # --- Guard: ensure regressor rows match the *future* rows we just asked for ---
         if reg_future is not None:
