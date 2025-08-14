@@ -1354,7 +1354,7 @@ async def run_sensor_job(sensor: SensorCfg,
             periods=steps,
             freq=freq,
             inclusive="right",
-            tz=pytz.UTC,
+            tz=timezone.utc,
         )
         
         # --- Build future regressors aligned to that exact grid ---
