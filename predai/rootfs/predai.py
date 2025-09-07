@@ -1498,7 +1498,7 @@ async def run_sensor_job(sensor: SensorCfg,
                     learning_rate=sensor.effective_learning_rate(role_cfg),
                     country=sensor.country,
                 )
-                backend.fit(df_fit)
+                backend.fit(df_fit, freq)
         
                 # Rebuild a matching future frame (historic=False) and trim any overshoot
                 df_future = backend.make_future(
