@@ -671,7 +671,7 @@ def resolve_n_lags(
     n_forecasts: int,
     *,
     cap: int | None = None,
-    cushion: int = 2,   ) -> int:
+    cushion: int = 5   ) -> int:
     """
     Resolve n_lags to a safe integer:
       - 'auto' -> min( data_max - cushion, cap ) and ≥1
