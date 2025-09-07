@@ -582,6 +582,31 @@ def normalise_history(raw: list[dict]) -> pd.DataFrame:
     return df[["ds", "value"]]
 
 
+def _complete_grid_after_resample(df: pd.DataFrame, freq: str, how: str, tz=None, ds_col: str = "ds", val_col: str = "y") -> pd.DataFrame:
+    """
+    Ensure a regular time grid after resample and fill gaps deterministically.
+
+    - For interval-like series (how == "sum"): fill missing bins with 0.0.
+    - For level-like series (how != "sum"): forward-fill, then back-fill one step.
+    Returns a frame with columns [ds_col, val_col] on a complete grid [start..end] with cadence=freq.
+    """
+    assert ds_col in df.columns and val_col in df.columns, (df.columns, ds_col, val_col)
+    ser = df.set_index(ds_col)[val_col]
+    tz = getattr(df[ds_col].dt, "tz", None) or tz
+    start = df[ds_col].min()
+    end = df[ds_col].max()
+    full_idx = pd.date_range(start=start, end=end, freq=freq, tz=tz)
+    ser = ser.reindex(full_idx)
+
+    if how == "sum":
+        ser = ser.fillna(0.0)
+    else:
+        ser = ser.ffill().bfill(limit=1)
+
+    out = ser.rename(val_col).to_frame().reset_index().rename(columns={"index": ds_col})
+    return out
+
+
 def resample_sensor(df: pd.DataFrame, freq: str, how: str) -> pd.DataFrame:
     if df.empty:
         return df
@@ -596,7 +621,7 @@ def resample_sensor(df: pd.DataFrame, freq: str, how: str) -> pd.DataFrame:
     else:  # mean default
         agg = df["value"].resample(freq).mean()
     out = agg.to_frame("value").reset_index()
-    out = out.dropna(subset=["value"])
+    out = _complete_grid_after_resample(out, freq=freq, how=how, ds_col="ds", val_col="value")
     logger.debug("Resampled result rows=%s", len(out))
     return out
 
@@ -680,6 +705,35 @@ def resolve_n_lags(sensor_cfg, role_cfg, train_rows: int, n_forecasts: int) -> i
 
     # Fall back to a normal integer
     return int(raw)
+
+
+def build_future_from_train_index(train_df: pd.DataFrame,
+                                  future_periods: int,
+                                  freq: str,
+                                  n_lags: int,
+                                  n_forecasts: int,
+                                  keep_history: bool = True) -> pd.DataFrame:
+    """
+    Create a future frame aligned to the resampled training ds grid.
+    Includes a tail of history length (n_lags + n_forecasts) if keep_history=True.
+    """
+    ds = train_df["ds"]
+    tz = getattr(ds.dt, "tz", None)
+    assert len(ds) > 1, "Empty train ds"
+    last_ds = ds.max()
+    step = pd.tseries.frequencies.to_offset(freq)
+    start_future = last_ds + step
+    end_future = start_future + (future_periods - 1) * step if future_periods > 0 else last_ds
+    fut_idx = pd.date_range(start=start_future, end=end_future, freq=freq, tz=tz)
+
+    if keep_history:
+        hist_len = max(0, int(n_lags) + int(n_forecasts))
+        hist_tail = ds.iloc[-hist_len:] if hist_len > 0 else ds.iloc[[-1]]
+        idx = pd.DatetimeIndex(hist_tail).append(pd.DatetimeIndex(fut_idx))
+    else:
+        idx = pd.DatetimeIndex(fut_idx)
+
+    return pd.DataFrame({"ds": idx})
 
 # --------------------------------------------------------------------------- #
 # CovariateResolver
@@ -1302,8 +1356,7 @@ async def run_sensor_job(sensor: SensorCfg,
                 sensor.output_units = "kWh"
 
     # Clean
-    df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0)
-    df = df.dropna(subset=["y"])
+    df["y"] = pd.to_numeric(df["y"], errors="coerce")
     logger.debug(
         "Sensor %s: cleaned data rows=%s", sensor.name, len(df)
     )
@@ -1399,6 +1452,10 @@ async def run_sensor_job(sensor: SensorCfg,
             # Final safety net
             train_df[cov_cols] = train_df[cov_cols].fillna(0.0)
 
+        train_df = train_df.dropna(subset=["y"])
+        _delta = train_df["ds"].diff().dropna().value_counts()
+        assert not _delta.empty and _delta.index[0] == pd.Timedelta(minutes=30), f"Cadence not 30min: {dict(_delta)}"
+
         # Log a summary after imputation
         summarise_df(f"train_imputed.{sensor.name}", train_df)
 
@@ -1414,83 +1471,38 @@ async def run_sensor_job(sensor: SensorCfg,
         )
         last_ts = train_df["ds"].max()
 
-        # The model was fit on train_df, which already includes any exogenous
-        # columns (lagged + future). Older NP versions require those columns to
-        # also be present in the 'df' passed to make_future_dataframe(...).
-        # Keep exactly the columns used at fit-time:
-        exog_cols = [c for c in train_df.columns if c not in ("ds", "y")]
-        df_fit_cols = ["ds", "y"] + exog_cols
-        df_fit = train_df[df_fit_cols].copy()
-
-        # --- Build the model’s future grid ourselves (UTC) ---
-        fut_idx = pd.date_range(
-            start=last_ts,
-            periods=steps,
+        df_future = build_future_from_train_index(
+            train_df=train_df,
+            future_periods=steps,
             freq=freq,
-            inclusive="right",
-            tz=timezone.utc,
+            n_lags=n_lags_eff,
+            n_forecasts=steps,
+            keep_history=True,
         )
-        
-        # --- Build future regressors aligned to that exact grid ---
-        reg_future = None
-        if sensor.covariates_future:
-            fut_names = [c for c in (list(sensor.covariates_future) + list(sensor.covariates_both)) if c in exog_cols]
-            if fut_names:
-                reg_future = pd.DataFrame({"ds": fut_idx})
-                for cov in fut_names:
-                    s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
-                    reg_future[cov] = s.to_numpy()
-        
-        # --- Make the future frame (NP will join future_regressors on 'ds') ---
-        df_future = backend.make_future(
-            df_fit,
-            periods=steps,
-            historic=False,
-            future_regressors=reg_future,
-        )
-        if "y" not in df_future.columns:
-            df_future["y"] = np.nan
-        df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
-
-        last_needed = fut_idx[-1]
-        overshoot = (df_future["ds"] > last_needed).sum()
-        if overshoot:
-            df_future = df_future[df_future["ds"] <= last_needed]
-
-        # --- Guard: ensure regressor rows match the *future* rows we just asked for ---
-        if reg_future is not None:
-            future_rows = (df_future["ds"] > last_ts).sum()
-            assert len(reg_future) == future_rows == len(fut_idx), \
-                f"Future regressor rows={len(reg_future)}; future frame rows={future_rows}; fut_idx={len(fut_idx)}"
-
-        
-        # --- Guard: ensure regressor rows match the *future* rows we just asked for ---
-        if reg_future is not None:
-            future_rows = (df_future["ds"] > last_ts).sum()
-            assert len(reg_future) == future_rows == len(fut_idx), \
-                f"Future regressor rows={len(reg_future)}; future frame rows={future_rows}; fut_idx={len(fut_idx)}"
-
-        # Some NP builds omit 'y' on future-only frames; add it if missing
-        if "y" not in df_future.columns:
-            df_future["y"] = np.nan
-        df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
-        summarise_df(f"future.{sensor.name}", df_future)
-        # Predict with fallback for NP length-mismatch
-        try:
-            fcst = backend.predict(df_future)
-        except ValueError as e:
-            logger.warning("Predict failed (%s). Retrying with n_historic_predictions=True to avoid NP reshape bug.", e)
-            df_future = backend.make_future(
-                df_fit,
-                periods=steps,
-                historic=True,
-                future_regressors=reg_future,
-            )
-            if "y" not in df_future.columns:
-                df_future["y"] = np.nan
-            df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
-            summarise_df(f"future_fallback.{sensor.name}", df_future)
-            fcst = backend.predict(df_future)
+        df_future = df_future.merge(train_df[["ds", "y"] + cov_cols], on="ds", how="left")
+        assert df_future["ds"].is_monotonic_increasing
+        fut_idx = pd.DatetimeIndex(df_future.loc[df_future["ds"] > last_ts, "ds"])
+        fut_names = [c for c in (list(sensor.covariates_future) + list(sensor.covariates_both)) if c in cov_cols]
+        for cov in fut_names:
+            s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
+            cov_df = s.rename(cov).reset_index().rename(columns={"index": "ds"})
+            cov_df = _complete_grid_after_resample(cov_df, freq=freq, how="mean", ds_col="ds", val_col=cov)
+            df_future = df_future.merge(cov_df, on="ds", how="left")
+        for name in cov_cols:
+            if name in df_future:
+                df_future[name] = df_future[name].ffill().bfill(limit=1)
+        _expected = len(df_future)
+        for col in (["y"] if "y" in df_future.columns else []) + list(cov_cols):
+            if col in df_future:
+                assert len(df_future[col]) == _expected, f"Future column length mismatch: {col} {_expected=} got {len(df_future[col])}"
+        _delta = df_future["ds"].diff().dropna().value_counts()
+        assert not _delta.empty and _delta.index[0] == pd.Timedelta(minutes=30), f"Future cadence not 30min: {dict(_delta)}"
+        deltas = df_future["ds"].diff().dropna().value_counts()
+        logger.info("DF future.%s: rows=%d cadence_ok=%s first3=%s last3=%s",
+                    sensor.name, len(df_future),
+                    (not deltas.empty and deltas.index[0] == pd.Timedelta(minutes=30)),
+                    list(df_future['ds'].head(3)), list(df_future['ds'].tail(3)))
+        fcst = backend.predict(df_future)
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
         summarise_df(f"forecast.{sensor.name}", fcst)
 
