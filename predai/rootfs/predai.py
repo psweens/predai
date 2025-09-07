@@ -667,9 +667,8 @@ def subtract_set(base: pd.DataFrame, sub: pd.DataFrame, *, inc: bool = False) ->
 def resolve_n_lags(sensor_cfg, role_cfg, train_rows: int, n_forecasts: int, cap: int | None = None) -> int:
     raw = sensor_cfg.n_lags if sensor_cfg.n_lags is not None else role_cfg.n_lags
     if isinstance(raw, str) and raw.strip().lower() == "auto":
-        auto_max = max(1, train_rows - n_forecasts - 1)
-        # cushion 1 (or 2) rows so predict has ≥ n_lags + n_forecasts
-        auto_max = max(1, auto_max - 1)
+        auto_max = max(1, train_rows - n_forecasts - 2)
+        # two-row cushion baked in above; no extra subtraction
         if cap is not None:
             auto_max = min(auto_max, int(cap))
         return int(auto_max)
@@ -1472,20 +1471,32 @@ async def run_sensor_job(sensor: SensorCfg,
         summarise_df(f"future.{sensor.name}", df_future)
         # Predict with fallback for NP length-mismatch
         try:
+            # First attempt on future-only frame
             fcst = backend.predict(df_future)
-        except ValueError as e:
-            logger.warning("Predict failed (%s). Retrying with n_historic_predictions=True to avoid NP reshape bug.", e)
-            df_future = backend.make_future(
+        except Exception as e:
+            logger.warning("Predict failed (%s). Retrying with historic context.", e)
+            df_fb = backend.make_future(
                 df_fit,
                 periods=steps,
                 historic=True,
                 future_regressors=reg_future,
             )
-            if "y" not in df_future.columns:
-                df_future["y"] = np.nan
-            df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
-            summarise_df(f"future_fallback.{sensor.name}", df_future)
-            fcst = backend.predict(df_future)
+            if "y" not in df_fb.columns:
+                df_fb["y"] = np.nan
+            df_fb["ds"] = pd.to_datetime(df_fb["ds"], utc=True)
+
+            # Trim any NP overshoot before predicting
+            try:
+                last_needed = fut_idx[-1]
+                df_fb = df_fb[df_fb["ds"] <= last_needed]
+            except Exception:
+                pass
+
+            summarise_df(f"future_fallback.{sensor.name}", df_fb)
+
+            fcst_full = backend.predict(df_fb)
+            # Only keep true-future rows for output
+            fcst = fcst_full[fcst_full["ds"] > last_ts].copy()
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
         summarise_df(f"forecast.{sensor.name}", fcst)
 
