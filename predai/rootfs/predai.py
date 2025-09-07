@@ -664,65 +664,22 @@ def subtract_set(base: pd.DataFrame, sub: pd.DataFrame, *, inc: bool = False) ->
     )
     return merged[["ds", "y"]]
 
-def resolve_n_lags(
-    sensor_cfg,
-    role_cfg,
-    train_rows: int,
-    n_forecasts: int,
-    *,
-    cap: int | None = None,
-    cushion: int = 5   ) -> int:
+def resolve_n_lags(sensor_cfg, role_cfg, train_rows: int, n_forecasts: int) -> int:
     """
-    Resolve n_lags to a safe integer:
-      - 'auto' -> min( data_max - cushion, cap ) and ≥1
-      - numeric -> clamp to both cap and data_max (so predict won't fail)
-    data_max = train_rows - n_forecasts - 1
+    Returns the final integer n_lags.
+    - If sensor/model config says 'auto', choose the maximum permissible value
+      so there's at least one training window: len(train_df) - n_forecasts - 1.
+    - Otherwise, coerce to int.
     """
-    # Prefer sensor override, then role default
-    raw = getattr(sensor_cfg, "n_lags", None)
-    if raw is None and role_cfg is not None:
-        raw = getattr(role_cfg, "n_lags", None)
+    # Prefer sensor override, else role default
+    raw = sensor_cfg.n_lags if sensor_cfg.n_lags is not None else role_cfg.n_lags
 
-    # Maximum allowed by the available data (before cushion)
-    data_max = max(1, int(train_rows) - int(n_forecasts) - 1)
-
-    def _apply_caps(x: int) -> int:
-        # subtract cushion, then cap, then clamp to data_max and ≥1
-        x = max(1, x - int(cushion))
-        if cap is not None:
-            x = min(x, int(cap))
-        x = min(x, data_max)  # final safety clamp to what data supports
-        return max(1, int(x))
-
-    # Case 1: auto
+    # Accept both int and string; treat 'auto' case-insensitively
     if isinstance(raw, str) and raw.strip().lower() == "auto":
-        chosen = _apply_caps(data_max)
-        try:
-            logger.info(
-                "Using n_lags=%s (mode=auto, train_rows=%s, n_forecasts=%s, cushion=%s, cap=%s, data_max=%s)",
-                chosen, train_rows, n_forecasts, cushion, cap, data_max
-            )
-        except NameError:
-            pass
-        return chosen
+        return max(1, int(train_rows) - int(n_forecasts) - 1)
 
-    # Case 2: numeric (or missing/malformed -> fall back to auto)
-    try:
-        numeric = int(raw)
-    except (TypeError, ValueError):
-        numeric = data_max  # behave like 'auto'
-    chosen = _apply_caps(numeric)
-    try:
-        logger.info(
-            "Using n_lags=%s (mode=%s, requested=%s, train_rows=%s, n_forecasts=%s, cushion=%s, cap=%s, data_max=%s)",
-            chosen, "fixed" if raw not in (None, "auto") else "auto-fallback",
-            raw, train_rows, n_forecasts, cushion, cap, data_max
-        )
-    except NameError:
-        pass
-    return chosen
-
-
+    # Fall back to a normal integer
+    return int(raw)
 
 # --------------------------------------------------------------------------- #
 # CovariateResolver
