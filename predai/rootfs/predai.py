@@ -667,8 +667,9 @@ def subtract_set(base: pd.DataFrame, sub: pd.DataFrame, *, inc: bool = False) ->
 def resolve_n_lags(sensor_cfg, role_cfg, train_rows: int, n_forecasts: int, cap: int | None = None) -> int:
     raw = sensor_cfg.n_lags if sensor_cfg.n_lags is not None else role_cfg.n_lags
     if isinstance(raw, str) and raw.strip().lower() == "auto":
-        auto_max = max(1, train_rows - n_forecasts - 2)
-        # two-row cushion baked in above; no extra subtraction
+        auto_max = max(1, train_rows - n_forecasts - 1)
+        # cushion 1 (or 2) rows so predict has ≥ n_lags + n_forecasts
+        auto_max = max(1, auto_max - 1)
         if cap is not None:
             auto_max = min(auto_max, int(cap))
         return int(auto_max)
@@ -1470,61 +1471,21 @@ async def run_sensor_job(sensor: SensorCfg,
         df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
         summarise_df(f"future.{sensor.name}", df_future)
         # Predict with fallback for NP length-mismatch
-        # First attempt (historic=False)
         try:
             fcst = backend.predict(df_future)
-        
-        except Exception as ex:
-            msg = str(ex)
-            need_downshift = "less than n_forecasts + n_lags" in msg
-        
-            if need_downshift:
-                # How many future rows did NP actually give us?
-                future_rows = int((df_future["ds"] > last_ts).sum())
-                logger.warning(
-                    "Predict size check failed. steps=%s, NP future_rows=%s. "
-                    "Rebuilding model with n_forecasts=%s.",
-                    steps, future_rows, future_rows
-                )
-                if future_rows <= 0:
-                    raise  # nothing sensible to do
-        
-                # Rebuild / refit with the downshifted n_forecasts
-                backend = NPBackend(
-                    n_lags=n_lags_eff,
-                    n_forecasts=future_rows,
-                    seasonality_reg=sensor.effective_seasonality_reg(role_cfg),
-                    seasonality_mode=sensor.effective_seasonality_mode(role_cfg),
-                    learning_rate=sensor.effective_learning_rate(role_cfg),
-                    country=sensor.country,
-                )
-                backend.fit(df_fit, freq)
-        
-                # Rebuild a matching future frame (historic=False) and trim any overshoot
-                df_future = backend.make_future(
-                    df_fit, periods=future_rows, historic=False, future_regressors=reg_future
-                )
-                df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
-                if "fut_idx" in locals():
-                    last_needed = fut_idx[-1]
-                    df_future = df_future[df_future["ds"] <= last_needed]
-        
-                # Second attempt – should now pass
-                fcst = backend.predict(df_future)
-        
-            else:
-                # Rare non-size errors: single historic fallback, then slice true future
-                logger.warning("Predict failed (%s). Retrying with historic context.", ex)
-                df_fb = backend.make_future(
-                    df_fit, periods=steps, historic=True, future_regressors=reg_future
-                )
-                df_fb["ds"] = pd.to_datetime(df_fb["ds"], utc=True)
-                if "fut_idx" in locals():
-                    last_needed = fut_idx[-1]
-                    df_fb = df_fb[df_fb["ds"] <= last_needed]
-                fcst_full = backend.predict(df_fb)
-                fcst = fcst_full[fcst_full["ds"] > last_ts].copy()
-
+        except ValueError as e:
+            logger.warning("Predict failed (%s). Retrying with n_historic_predictions=True to avoid NP reshape bug.", e)
+            df_future = backend.make_future(
+                df_fit,
+                periods=steps,
+                historic=True,
+                future_regressors=reg_future,
+            )
+            if "y" not in df_future.columns:
+                df_future["y"] = np.nan
+            df_future["ds"] = pd.to_datetime(df_future["ds"], utc=True)
+            summarise_df(f"future_fallback.{sensor.name}", df_future)
+            fcst = backend.predict(df_future)
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
         summarise_df(f"forecast.{sensor.name}", fcst)
 
