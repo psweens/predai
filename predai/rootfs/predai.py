@@ -664,22 +664,17 @@ def subtract_set(base: pd.DataFrame, sub: pd.DataFrame, *, inc: bool = False) ->
     )
     return merged[["ds", "y"]]
 
-def resolve_n_lags(sensor_cfg, role_cfg, train_rows: int, n_forecasts: int) -> int:
-    """
-    Returns the final integer n_lags.
-    - If sensor/model config says 'auto', choose the maximum permissible value
-      so there's at least one training window: len(train_df) - n_forecasts - 1.
-    - Otherwise, coerce to int.
-    """
-    # Prefer sensor override, else role default
+def resolve_n_lags(sensor_cfg, role_cfg, train_rows: int, n_forecasts: int, cap: int | None = None) -> int:
     raw = sensor_cfg.n_lags if sensor_cfg.n_lags is not None else role_cfg.n_lags
-
-    # Accept both int and string; treat 'auto' case-insensitively
     if isinstance(raw, str) and raw.strip().lower() == "auto":
-        return max(1, int(train_rows) - int(n_forecasts) - 1)
-
-    # Fall back to a normal integer
+        auto_max = max(1, train_rows - n_forecasts - 1)
+        # cushion 1 (or 2) rows so predict has ≥ n_lags + n_forecasts
+        auto_max = max(1, auto_max - 1)
+        if cap is not None:
+            auto_max = min(auto_max, int(cap))
+        return int(auto_max)
     return int(raw)
+
 
 # --------------------------------------------------------------------------- #
 # CovariateResolver
