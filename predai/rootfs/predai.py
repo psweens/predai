@@ -154,20 +154,25 @@ def cum_to_interval_gap_aware(cum: pd.Series, freq: str, reset_daily: bool = Fal
     return y.astype("float32")
 
 
-def clip_outliers_quantile(y: pd.Series, q: float = 0.995) -> pd.Series:
+def clip_outliers_quantile(s, q: float = 0.995, positive_only: bool = True):
     """
-    Hard-cap extreme bins so catch-up spikes don't set the scale.
-    Uses upper quantile on finite values; returns float32.
+    Clip the upper tail at the q-quantile.
+    If positive_only is True, compute the quantile using only strictly-positive values.
+    If the computed cap is <= 0 or cannot be computed, skip clipping.
     """
-    if y is None or y.empty:
-        return pd.Series(dtype="float32")
-    yy = y[np.isfinite(y)]
-    if yy.empty:
-        return y.fillna(0.0).astype("float32")
-    cap = float(yy.quantile(q))
-    if np.isnan(cap) or np.isinf(cap):
-        return y.fillna(0.0).astype("float32")
-    return y.fillna(0.0).clip(lower=0.0, upper=cap).astype("float32")
+    yy = pd.Series(s).astype("float32")
+    ref = yy[yy > 0] if positive_only else yy
+
+    if ref.empty:
+        # Nothing to measure; skip
+        return yy
+
+    cap = ref.quantile(q)
+    if cap is None or not np.isfinite(cap) or float(cap) <= 0.0:
+        # Unsafe cap; skip
+        return yy
+
+    return yy.clip(lower=0.0, upper=float(cap)).astype("float32")
 
 
 # --------------------------------------------------------------------------- #
@@ -1565,20 +1570,37 @@ async def run_sensor_job(sensor: SensorCfg,
         logger.debug("Cumulative->interval result rows=%d", len(y))
         y = y.resample(freq).asfreq().fillna(0.0).astype("float32")
 
-        # Robust cap to prevent single-bucket catch-up spikes
-        if len(y) >= 10:  # minimal guard
-            q = 0.995  # p99.5; adjust to 0.99 if you want stronger capping
-            cap_val = float(y.quantile(q)) if np.isfinite(y.quantile(q)) else None
-            y = clip_outliers_quantile(y, q=q)
-            if cap_val is not None:
+        # --- Outlier capping on interval y (safe, positives-only) ---
+        outlier_q = getattr(sensor, "outlier_cap_q", 0.995)
+
+        if outlier_q is not None:
+            # Compute cap from strictly-positive values only
+            y_series = pd.Series(y).astype("float32")
+            pos = y_series[y_series > 0]
+            nonzero_share = 100.0 * (len(pos) / max(1, len(y_series)))
+            cap_val = float(pos.quantile(outlier_q)) if len(pos) > 0 else float("nan")
+
+            if np.isfinite(cap_val) and cap_val > 0.0:
+                y_series = y_series.clip(lower=0.0, upper=cap_val)
                 logger.info(
-                    "Outlier cap applied at p%.2f=%.3f; y.max() post-cap=%.3f",
-                    100 * q,
+                    "Outlier cap applied at p%.2f of positives=%.3f; y.max() post-cap=%.3f; nonzero_share=%.2f%%",
+                    outlier_q * 100.0,
                     cap_val,
-                    float(y.max()),
+                    float(y_series.max()),
+                    nonzero_share,
                 )
-        else:
-            y = y.fillna(0.0).clip(lower=0.0).astype("float32")
+            else:
+                logger.info(
+                    "Outlier capping skipped (cap<=0 or insufficient positives). nonzero_share=%.2f%%",
+                    nonzero_share,
+                )
+            y = y_series
+
+        # Guard: if preprocessing flattened the target, stop early to avoid NP crash.
+        if pd.Series(y).nunique(dropna=True) < 2:
+            msg = "Target became constant after preprocessing (likely extreme sparsity). Skipping training."
+            logger.error(msg)
+            return
 
         df = y.to_frame("y").reset_index().rename(columns={"index": "ds"})
         logger.info(
@@ -1689,13 +1711,14 @@ async def run_sensor_job(sensor: SensorCfg,
                 logger.debug(
                     "Covariate %s lagged: merged %s rows", cov, len(s)
                 )
+                is_binary = bool(is_binary_cov_name(cov, sensor) or is_binary_like(s))
                 n_lags_for_cov = _lags_for_covariate(cov, n_lags_eff, sensor)
                 backend.add_lagged_regressor(cov, n_lags=n_lags_for_cov)
                 logger.info(
                     "Added lagged regressor %s with n_lags=%d (binary=%s)",
                     cov,
                     n_lags_for_cov,
-                    is_binary_cov_name(cov, sensor),
+                    is_binary,
                 )
             else:
                 logger.debug("Covariate %s lagged: no history.", cov)
