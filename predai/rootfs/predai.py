@@ -175,6 +175,152 @@ def clip_outliers_quantile(s, q: float = 0.995, positive_only: bool = True):
     return yy.clip(lower=0.0, upper=float(cap)).astype("float32")
 
 
+def _get_local_tz(cfg):
+    """Return configured timezone string or 'UTC'."""
+    try:
+        # If cfg already carries a timezone string, reuse it
+        tz = getattr(cfg, "timezone", None)
+        if tz:
+            return tz
+        tzname = getattr(cfg, "timezone_name", None)
+        if tzname:
+            return tzname
+        tzobj = getattr(cfg, "tz", None)
+        if tzobj:
+            return str(tzobj)
+    except Exception:
+        pass
+    return "UTC"
+
+
+def is_daily_cumulative_sensor(entity_id: str, unit: str | None, state_class: str | None) -> bool:
+    """Heuristic: identify daily cumulative sensors (e.g., names containing 'today' or 'daily' + total_increasing)."""
+    name = (entity_id or "").lower()
+    unit = (unit or "").lower()
+    sc = (state_class or "").lower()
+    return (("today" in name) or ("daily" in name)) and ("total_increasing" in sc)
+
+
+def cumulative_to_interval_daily(raw_df: pd.DataFrame,
+                                 ts_col: str = "ts",
+                                 val_col: str = "val",
+                                 local_tz: str = "UTC",
+                                 drop_negatives: bool = True,
+                                 tiny_eps: float = 1e-6) -> pd.DataFrame:
+    """
+    Convert a daily-reset total_increasing series to intervals by:
+      1) grouping by local calendar day,
+      2) diff within each day,
+      3) clipping tiny/negative deltas to 0,
+      4) first sample of each day becomes 0 (diff=NaN -> 0).
+    Returns a DataFrame with columns [ts, y] at original timestamps (not yet resampled).
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=[ts_col, "y"])
+
+    df = raw_df[[ts_col, val_col]].dropna().copy()
+    if df.empty:
+        return pd.DataFrame(columns=[ts_col, "y"])
+
+    # Ensure tz-aware timestamps
+    df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
+    # Convert to local tz to compute local-day grouping
+    local = df[ts_col].dt.tz_convert(local_tz)
+    df["_day"] = local.dt.floor("D")
+
+    # Diff within each local day
+    df["y"] = df.groupby("_day", sort=False)[val_col].diff()
+
+    # Handle negatives/noise: tiny negatives and any negatives -> 0
+    neg = df["y"] < 0
+    tiny = df["y"].between(-tiny_eps, 0, inclusive="neither")
+    df.loc[neg | tiny, "y"] = 0.0
+
+    # First value per day had NaN diff → 0
+    df["y"] = df["y"].fillna(0.0)
+
+    out = df[[ts_col, "y"]].copy()
+    out["y"] = out["y"].astype("float32")
+    return out
+
+
+def resample_intervals_sum(df: pd.DataFrame,
+                           ts_col: str = "ts",
+                           y_col: str = "y",
+                           freq: str = "30min") -> pd.DataFrame:
+    """
+    Resample an interval series to fixed cadence by sum.
+    Missing bins become 0 (no forward fill).
+    Returns columns ['ds','y'].
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ds", "y"])
+    x = df.set_index(ts_col)[y_col].astype("float32")
+    y = x.resample(freq).sum().asfreq(freq, fill_value=0.0).astype("float32")
+    return y.reset_index().rename(columns={ts_col: "ds", y_col: "y"})
+
+
+def cumulative_to_interval_naive_fallback(raw_df: pd.DataFrame,
+                                          resample_freq: str = "30min") -> pd.DataFrame:
+    """
+    Prior behavior: simple diff across entire series, negatives -> 0, then resample by sum.
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=["ds", "y"])
+    df = raw_df[["ts", "val"]].dropna().copy()
+    if df.empty:
+        return pd.DataFrame(columns=["ds", "y"])
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df = df.sort_values("ts")
+    diff = df["val"].astype("float32").diff().fillna(0.0)
+    diff = diff.mask(diff < 0.0, 0.0).astype("float32")
+    intervals = pd.DataFrame({"ts": df["ts"], "y": diff})
+    y30 = resample_intervals_sum(intervals, ts_col="ts", y_col="y", freq=resample_freq)
+    pos_after = int((y30["y"] > 0).sum())
+    nonzero_share = 100.0 * pos_after / max(1, len(y30))
+    logging.info("Naive diff result rows=%d; positive buckets=%d (%.2f%%); y.max=%.3f; y.sum=%.3f",
+                 len(y30), pos_after, nonzero_share, float(y30["y"].max()), float(y30["y"].sum()))
+    return y30
+
+
+def cumulative_to_interval_gapaware_with_daily(raw_df: pd.DataFrame,
+                                               entity_id: str,
+                                               unit: str | None,
+                                               state_class: str | None,
+                                               cfg,
+                                               resample_freq: str = "30min") -> pd.DataFrame:
+    """
+    Preferred path for sensors like '*…today*' with total_increasing semantics:
+      1) daily segmentation diff → intervals
+      2) resample by sum to fixed cadence
+      3) if result is all zeros, fall back to naive diff+resample (with warning)
+    """
+    tz = _get_local_tz(cfg)
+    # Decide whether to try daily segmentation first
+    if is_daily_cumulative_sensor(entity_id, unit, state_class):
+        logging.debug("Cumulative->interval(daily) on %d rows (entity=%s, tz=%s)",
+                      0 if raw_df is None else len(raw_df), entity_id, tz)
+        intervals = cumulative_to_interval_daily(raw_df, ts_col="ts", val_col="val", local_tz=tz)
+        pos_before = int((intervals["y"] > 0).sum()) if not intervals.empty else 0
+        logging.debug("Daily-seg: positives before resample=%d / %d", pos_before, 0 if intervals is None else len(intervals))
+
+        y30 = resample_intervals_sum(intervals, ts_col="ts", y_col="y", freq=resample_freq)
+        pos_after = int((y30["y"] > 0).sum()) if not y30.empty else 0
+        nonzero_share = 100.0 * pos_after / max(1, len(y30))
+        logging.info("Daily-seg result rows=%d; positive buckets=%d (%.2f%%); y.max=%.3f; y.sum=%.3f",
+                     len(y30), pos_after, nonzero_share,
+                     float(0 if y30.empty else y30["y"].max()),
+                     float(0 if y30.empty else y30["y"].sum()))
+
+        if pos_after == 0:
+            logging.warning("Daily-seg produced all zeros; falling back to naive diff.")
+            return cumulative_to_interval_naive_fallback(raw_df, resample_freq=resample_freq)
+        return y30
+
+    # Otherwise, use the naive path directly
+    return cumulative_to_interval_naive_fallback(raw_df, resample_freq=resample_freq)
+
+
 # --------------------------------------------------------------------------- #
 # Utility: timestamps
 # --------------------------------------------------------------------------- #
@@ -1556,26 +1702,36 @@ async def run_sensor_job(sensor: SensorCfg,
     agg = sensor.effective_aggregation(role_cfg)      # keep "sum" for energy
 
     # --------------------------------------------------
-    # 1.  Convert cumulative counter → interval (gap-aware)
+    # 1.  Convert cumulative counter → interval (daily-aware)
     # --------------------------------------------------
     if sensor.source_is_cumulative:
-        series = df.set_index("ds")["value"]
-        logger.debug("Cumulative->interval(gap-aware) on %d rows", len(series))
-        y = cum_to_interval_gap_aware(
-            cum=series,
-            freq=freq,
-            reset_daily=bool(getattr(sensor, "reset_daily", False)),
-            tz=str(cfg.tz) if getattr(cfg, "tz", None) else None,
+        raw_df = df.rename(columns={"ds": "ts", "value": "val"})[["ts", "val"]]
+        logging.debug("Cumulative->interval(gap-aware) on %d rows", len(raw_df))
+        _entity_id = getattr(sensor, "entity_id", getattr(sensor, "name", "unknown"))
+        _unit = getattr(sensor, "units", None)
+        _state_class = getattr(sensor, "state_class", None)
+
+        y30 = cumulative_to_interval_gapaware_with_daily(
+            raw_df=raw_df,
+            entity_id=_entity_id,
+            unit=_unit,
+            state_class=_state_class,
+            cfg=cfg,
+            resample_freq=freq,
         )
-        logger.debug("Cumulative->interval result rows=%d", len(y))
-        y = y.resample(freq).asfreq().fillna(0.0).astype("float32")
+        logging.info(
+            "Sensor %s: after daily-aware conversion %d rows from %s",
+            _entity_id,
+            len(y30),
+            freq,
+        )
 
         # --- Outlier capping on interval y (safe, positives-only) ---
         outlier_q = getattr(sensor, "outlier_cap_q", 0.995)
 
         if outlier_q is not None:
             # Compute cap from strictly-positive values only
-            y_series = pd.Series(y).astype("float32")
+            y_series = y30["y"].astype("float32")
             pos = y_series[y_series > 0]
             nonzero_share = 100.0 * (len(pos) / max(1, len(y_series)))
             cap_val = float(pos.quantile(outlier_q)) if len(pos) > 0 else float("nan")
@@ -1589,26 +1745,20 @@ async def run_sensor_job(sensor: SensorCfg,
                     float(y_series.max()),
                     nonzero_share,
                 )
+                y30["y"] = y_series
             else:
                 logger.info(
                     "Outlier capping skipped (cap<=0 or insufficient positives). nonzero_share=%.2f%%",
                     nonzero_share,
                 )
-            y = y_series
 
         # Guard: if preprocessing flattened the target, stop early to avoid NP crash.
-        if pd.Series(y).nunique(dropna=True) < 2:
+        if y30["y"].nunique(dropna=True) < 2:
             msg = "Target became constant after preprocessing (likely extreme sparsity). Skipping training."
             logger.error(msg)
             return
 
-        df = y.to_frame("y").reset_index().rename(columns={"index": "ds"})
-        logger.info(
-            "Sensor %s: after gap-aware conversion %s rows from %s",
-            sensor.name,
-            len(df),
-            freq,
-        )
+        df = y30
     else:
         # --------------------------------------------------
         # 2.  Resample the interval series (sum / mean / last)
@@ -1757,6 +1907,16 @@ async def run_sensor_job(sensor: SensorCfg,
 
         # Log a summary after imputation
         summarise_df(f"train_imputed.{sensor.name}", train_df)
+
+        _npos = int((train_df["y"] > 0).sum()) if len(train_df) else 0
+        logging.info(
+            "Train y: rows=%d, positives=%d (%.2f%%), y.max=%.3f, y.sum=%.3f",
+            len(train_df),
+            _npos,
+            (100.0 * _npos / max(1, len(train_df))),
+            float(0 if train_df.empty else train_df["y"].max()),
+            float(0 if train_df.empty else train_df["y"].sum()),
+        )
 
         # Fit
         backend.fit(train_df, freq=freq)
