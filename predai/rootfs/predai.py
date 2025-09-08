@@ -98,6 +98,78 @@ def summarise_df(tag: str, df: pd.DataFrame):
 # ---- end helpers ----
 
 
+# --- Gap-aware cumulative → interval conversion ---
+
+def _cum_to_interval_gap_aware_single_day(s: pd.Series, freq: str) -> pd.Series:
+    """
+    s: cumulative values for a single day (sorted, tz-aware or naive)
+    Returns interval increments on a regular freq grid, distributing gaps.
+    """
+    if s is None or s.empty:
+        return pd.Series(dtype="float32")
+    # keep finite & sorted
+    s = s[pd.notna(s)].sort_index()
+    if s.empty:
+        return pd.Series(dtype="float32")
+    # Interpolate cumulative to the regular grid, then edge-diff
+    grid = s.resample(freq).interpolate("time")  # linear interpolation over gaps
+    y = grid.diff().fillna(0.0).clip(lower=0.0)
+    return y.astype("float32")
+
+
+def cum_to_interval_gap_aware(cum: pd.Series, freq: str, reset_daily: bool = False, tz: str | None = None) -> pd.Series:
+    """
+    Convert cumulative series to interval series on a regular grid.
+    If reset_daily=True, operate within each local day separately.
+    """
+    if cum is None or len(cum) == 0:
+        # still return an empty grid (caller typically resamples later)
+        return pd.Series(dtype="float32")
+
+    s = cum[pd.notna(cum)].sort_index()
+    if s.empty:
+        return pd.Series(dtype="float32")
+
+    # Optional: enforce non-decreasing within a day (comment out if not desired)
+    # s = s.cummax()
+
+    if not reset_daily:
+        return _cum_to_interval_gap_aware_single_day(s, freq)
+
+    # Daily mode: split by local day, interpolate per-day, then concat
+    idx = s.index
+    if getattr(idx, "tz", None) is not None and tz is not None:
+        day_keys = idx.tz_convert(tz).normalize()
+    else:
+        # fall back to existing timezone or naive midnights
+        day_keys = idx.normalize()
+
+    parts = []
+    for _, part in s.groupby(day_keys, sort=True):
+        y_part = _cum_to_interval_gap_aware_single_day(part, freq)
+        parts.append(y_part)
+    if not parts:
+        return pd.Series(dtype="float32")
+    y = pd.concat(parts).sort_index()
+    return y.astype("float32")
+
+
+def clip_outliers_quantile(y: pd.Series, q: float = 0.995) -> pd.Series:
+    """
+    Hard-cap extreme bins so catch-up spikes don't set the scale.
+    Uses upper quantile on finite values; returns float32.
+    """
+    if y is None or y.empty:
+        return pd.Series(dtype="float32")
+    yy = y[np.isfinite(y)]
+    if yy.empty:
+        return y.fillna(0.0).astype("float32")
+    cap = float(yy.quantile(q))
+    if np.isnan(cap) or np.isinf(cap):
+        return y.fillna(0.0).astype("float32")
+    return y.fillna(0.0).clip(lower=0.0, upper=cap).astype("float32")
+
+
 # --------------------------------------------------------------------------- #
 # Utility: timestamps
 # --------------------------------------------------------------------------- #
@@ -1476,27 +1548,58 @@ async def run_sensor_job(sensor: SensorCfg,
 
     df_cum_raw = df.copy()
 
+    agg = sensor.effective_aggregation(role_cfg)      # keep "sum" for energy
+
     # --------------------------------------------------
-    # 1.  Convert cumulative counter → interval
+    # 1.  Convert cumulative counter → interval (gap-aware)
     # --------------------------------------------------
     if sensor.source_is_cumulative:
-        df = cumulative_to_interval(df, sensor.reset_detection, sensor.max_increment)
-        # resampler needs a column called 'value', so replace it
-        df["value"] = df["y"]
-    
-    # --------------------------------------------------
-    # 2.  Resample the interval series (sum / mean / last)
-    # --------------------------------------------------
-    agg = sensor.effective_aggregation(role_cfg)      # keep "sum" for energy
-    df = resample_sensor(df, freq, agg)
-    logger.info(
-        "Sensor %s: after resample %s rows from %s", sensor.name, len(df), freq
-    )
-    
-    # --------------------------------------------------
-    # 3.  Rename value → y (now exists for *all* sensors)
-    # --------------------------------------------------
-    df = df.rename(columns={"value": "y"})
+        series = df.set_index("ds")["value"]
+        logger.debug("Cumulative->interval(gap-aware) on %d rows", len(series))
+        y = cum_to_interval_gap_aware(
+            cum=series,
+            freq=freq,
+            reset_daily=bool(getattr(sensor, "reset_daily", False)),
+            tz=str(cfg.tz) if getattr(cfg, "tz", None) else None,
+        )
+        logger.debug("Cumulative->interval result rows=%d", len(y))
+        y = y.resample(freq).asfreq().fillna(0.0).astype("float32")
+
+        # Robust cap to prevent single-bucket catch-up spikes
+        if len(y) >= 10:  # minimal guard
+            q = 0.995  # p99.5; adjust to 0.99 if you want stronger capping
+            cap_val = float(y.quantile(q)) if np.isfinite(y.quantile(q)) else None
+            y = clip_outliers_quantile(y, q=q)
+            if cap_val is not None:
+                logger.info(
+                    "Outlier cap applied at p%.2f=%.3f; y.max() post-cap=%.3f",
+                    100 * q,
+                    cap_val,
+                    float(y.max()),
+                )
+        else:
+            y = y.fillna(0.0).clip(lower=0.0).astype("float32")
+
+        df = y.to_frame("y").reset_index().rename(columns={"index": "ds"})
+        logger.info(
+            "Sensor %s: after gap-aware conversion %s rows from %s",
+            sensor.name,
+            len(df),
+            freq,
+        )
+    else:
+        # --------------------------------------------------
+        # 2.  Resample the interval series (sum / mean / last)
+        # --------------------------------------------------
+        df = resample_sensor(df, freq, agg)
+        logger.info(
+            "Sensor %s: after resample %s rows from %s", sensor.name, len(df), freq
+        )
+
+        # --------------------------------------------------
+        # 3.  Rename value → y (now exists for *all* sensors)
+        # --------------------------------------------------
+        df = df.rename(columns={"value": "y"})
 
     if sensor.subtract:
         for sub_name in sensor.subtract:
