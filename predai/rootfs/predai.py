@@ -193,6 +193,8 @@ class SensorCfg:
     covariates_future: List[str] = field(default_factory=list)
     covariates_lagged: List[str] = field(default_factory=list)
     covariates_both: List[str] = field(default_factory=list)
+    covariates_binary: Optional[List[str]] = None  # names explicitly treated as binary
+    binary_lag_cap: Optional[int] = 96            # cap n_lags for binary covariates (None = no cap)
 
     n_lags: Optional[int] = None
     seasonality_reg: Optional[float] = None
@@ -312,6 +314,8 @@ def _load_sensor(dflt: Dict[str, Any], d: Dict[str, Any]) -> SensorCfg:
         covariates_future=(merged.get("covariates_future") or merged.get("future") or []),
         covariates_lagged=(merged.get("covariates_lagged") or merged.get("lagged") or []),
         covariates_both=(merged.get("covariates_both") or merged.get("lagged_future") or []),
+        covariates_binary=merged.get("covariates_binary"),
+        binary_lag_cap=merged.get("binary_lag_cap", 96),
         n_lags=merged.get("n_lags"),
         seasonality_reg=merged.get("seasonality_reg"),
         seasonality_mode=merged.get("seasonality_mode"),
@@ -626,6 +630,68 @@ def resample_sensor(df: pd.DataFrame, freq: str, how: str) -> pd.DataFrame:
     return out
 
 
+# --- Binary covariate utilities ---------------------------------------------
+BOOL_STR_MAP = {
+    "on": 1.0, "off": 0.0,
+    "true": 1.0, "false": 0.0,
+    "yes": 1.0, "no": 0.0,
+    "open": 1.0, "closed": 0.0,
+    "home": 1.0, "away": 0.0,
+    "detected": 1.0, "clear": 0.0,
+    "armed": 1.0, "disarmed": 0.0,
+}
+
+def _to_numeric_or_bool(s: pd.Series) -> pd.Series:
+    """Map common boolean-ish strings to 0/1, else numeric; keep NaN."""
+    if s.dtype == object:
+        s2 = s.astype(str).str.strip().str.lower().map(BOOL_STR_MAP)
+        num = pd.to_numeric(s, errors="coerce")
+        s = s2.where(s2.notna(), num)
+    else:
+        s = pd.to_numeric(s, errors="coerce")
+    return s
+
+def is_binary_like(series: pd.Series, min_obs: int = 20) -> bool:
+    """True if values (after coercion) are subset of {0,1}."""
+    x = _to_numeric_or_bool(series).dropna().astype(float)
+    if len(x) == 0:
+        return False
+    uniq = pd.unique(x.round(6))
+    return set(np.round(uniq, 6)).issubset({0.0, 1.0})
+
+def coerce_to_binary(series: pd.Series) -> pd.Series:
+    """Force strict 0/1 without NaNs (ffill/bfill/0)."""
+    x = _to_numeric_or_bool(series)
+    if x.dropna().between(0.0, 1.0).all():
+        x = (x.fillna(method="ffill").fillna(method="bfill").fillna(0.0) > 0.5).astype(float)
+    else:
+        x = x.round().clip(0, 1).astype(float)
+    return x
+
+def resample_covariate(series: pd.Series, freq: str, *, is_binary: bool) -> pd.Series:
+    """Resample: binary uses step (ffill); continuous uses mean."""
+    s = series.sort_index()
+    if is_binary:
+        s = coerce_to_binary(s)
+        s = s.resample(freq).ffill()
+        s = s.ffill().bfill().fillna(0.0)
+        s = s.clip(0, 1).round().astype(float)
+    else:
+        s = s.resample(freq).mean()
+    return s
+
+def is_binary_cov_name(name: str, sensor_cfg) -> bool:
+    cfg_list = set(sensor_cfg.covariates_binary or [])
+    return name in cfg_list
+
+def _lags_for_covariate(cov_name: str, base_n_lags: int, sensor_cfg) -> int:
+    """Optionally cap lags for binary covariates."""
+    if is_binary_cov_name(cov_name, sensor_cfg):
+        cap = sensor_cfg.binary_lag_cap
+        return min(base_n_lags, cap) if cap else base_n_lags
+    return base_n_lags
+
+
 def cumulative_to_interval(df: pd.DataFrame, reset_cfg: ResetDetectionCfg, max_increment: Optional[float] = None) -> pd.DataFrame:
     if df.empty:
         df["y"] = []
@@ -769,7 +835,7 @@ class CovariateResolver:
             }
         return {"entity": str(val), "scale": 1.0}
 
-    async def get_hist_series(self, cov_name: str, start: datetime, end: datetime, freq: str, how: str) -> pd.Series:
+    async def get_hist_series(self, cov_name: str, start: datetime, end: datetime, freq: str, how: str, sensor_cfg: Optional[SensorCfg] = None) -> pd.Series:
         meta = self._resolve(cov_name)
         entity_id = meta["entity"]
         logger.debug(
@@ -786,16 +852,40 @@ class CovariateResolver:
         )
         if df.empty:
             return pd.Series([], dtype=float)
-        # never sum temps/% etc.; if how=='sum' use mean
-        df = resample_sensor(df, freq, "mean" if how == "sum" else how)
+
+        cov_series = df.set_index("ds")["value"]
+
+        bin_cfg = is_binary_cov_name(cov_name, sensor_cfg) if sensor_cfg else False
+        bin_auto = is_binary_like(cov_series)
+        is_bin = bool(bin_cfg or bin_auto)
+
+        cov_series = resample_covariate(cov_series, freq, is_binary=is_bin)
+
         logger.debug(
-            "Covariate %s: resampled rows=%s", cov_name, len(df)
+            "Covariate %s: binary=%s (cfg=%s auto=%s) rows=%d",
+            cov_name,
+            is_bin,
+            bin_cfg,
+            bin_auto,
+            len(cov_series),
         )
-        df["value"] = df["value"] * meta.get("scale", 1.0)
-        logger.debug(
-            "Covariate %s: scaled by %s", cov_name, meta.get("scale", 1.0)
-        )
-        out = df.set_index("ds")["value"]
+        if is_bin:
+            mn, mx = float(cov_series.min()), float(cov_series.max())
+            uniq = sorted(pd.unique(cov_series.dropna()))[:4]
+            logger.info(
+                "Covariate %s treated as BINARY: min=%.1f max=%.1f uniques~%s",
+                cov_name,
+                mn,
+                mx,
+                uniq,
+            )
+
+        scale = float(meta.get("scale", 1.0))
+        if not is_bin:
+            cov_series = cov_series * scale
+            logger.debug("Covariate %s: scaled by %s", cov_name, scale)
+
+        out = cov_series
         logger.info(
             "Covariate %s: min=%s max=%s %s",
             cov_name,
@@ -811,7 +901,7 @@ class CovariateResolver:
         )
         return out
 
-    async def get_future_series(self, cov_name: str, future_index: pd.DatetimeIndex, default: float = 0.0) -> pd.Series:
+    async def get_future_series(self, cov_name: str, future_index: pd.DatetimeIndex, default: float = 0.0, sensor_cfg: Optional[SensorCfg] = None) -> pd.Series:
         meta = self._resolve(cov_name)
         entity_id = meta["entity"]
         scale = float(meta.get("scale", 1.0))
@@ -821,10 +911,36 @@ class CovariateResolver:
         if not attr_name:
             val = await self.iface.get_state(entity_id)
             try:
-                v = float(val) * scale
+                v = float(val)
             except (TypeError, ValueError):
                 v = float(default)
-            return pd.Series(v, index=future_index)
+            s = pd.Series(v, index=future_index)
+            bin_cfg = is_binary_cov_name(cov_name, sensor_cfg) if sensor_cfg else False
+            bin_auto = is_binary_like(s)
+            is_bin = bool(bin_cfg or bin_auto)
+            if is_bin:
+                s = coerce_to_binary(s)
+            else:
+                s = s * scale
+            logger.debug(
+                "Covariate %s future: binary=%s (cfg=%s auto=%s) rows=%d",
+                cov_name,
+                is_bin,
+                bin_cfg,
+                bin_auto,
+                len(s),
+            )
+            if is_bin:
+                mn, mx = float(s.min()), float(s.max())
+                uniq = sorted(pd.unique(s.dropna()))[:4]
+                logger.info(
+                    "Covariate %s treated as BINARY: min=%.1f max=%.1f uniques~%s",
+                    cov_name,
+                    mn,
+                    mx,
+                    uniq,
+                )
+            return s
     
         # 1) Fetch future series payload from HA
         payload = await self.iface.get_state(entity_id, attribute=attr_name) or []
@@ -846,7 +962,33 @@ class CovariateResolver:
     
         if val_col is None:
             # Nothing numeric -> fill defaults
-            return pd.Series(float(default), index=future_index)
+            s = pd.Series(float(default), index=future_index)
+            bin_cfg = is_binary_cov_name(cov_name, sensor_cfg) if sensor_cfg else False
+            bin_auto = is_binary_like(s)
+            is_bin = bool(bin_cfg or bin_auto)
+            if is_bin:
+                s = coerce_to_binary(s)
+            else:
+                s = s * scale
+            logger.debug(
+                "Covariate %s future: binary=%s (cfg=%s auto=%s) rows=%d",
+                cov_name,
+                is_bin,
+                bin_cfg,
+                bin_auto,
+                len(s),
+            )
+            if is_bin:
+                mn, mx = float(s.min()), float(s.max())
+                uniq = sorted(pd.unique(s.dropna()))[:4]
+                logger.info(
+                    "Covariate %s treated as BINARY: min=%.1f max=%.1f uniques~%s",
+                    cov_name,
+                    mn,
+                    mx,
+                    uniq,
+                )
+            return s
 
         # Convert the model’s index to a DataFrame for joining
         target = pd.DataFrame({"ds": pd.to_datetime(future_index, utc=True)}).sort_values("ds")
@@ -883,10 +1025,34 @@ class CovariateResolver:
             # Unknown shape: just fill default
             out = pd.Series(float(default), index=target.index)
     
-        # 3) Scale, fill gaps deterministically, and return with the original index
-        s = pd.to_numeric(out, errors="coerce") * scale
-        # Fill any missing values (choose policy to taste)
-        s = s.ffill().fillna(float(default))
+        # 3) Scale / coerce binary, fill gaps deterministically, and return with the original index
+        s = pd.to_numeric(out, errors="coerce")
+        bin_cfg = is_binary_cov_name(cov_name, sensor_cfg) if sensor_cfg else False
+        bin_auto = is_binary_like(s)
+        is_bin = bool(bin_cfg or bin_auto)
+        if is_bin:
+            s = coerce_to_binary(s)
+        else:
+            s = s * scale
+            s = s.ffill().fillna(float(default))
+        logger.debug(
+            "Covariate %s future: binary=%s (cfg=%s auto=%s) rows=%d",
+            cov_name,
+            is_bin,
+            bin_cfg,
+            bin_auto,
+            len(s),
+        )
+        if is_bin:
+            mn, mx = float(s.min()), float(s.max())
+            uniq = sorted(pd.unique(s.dropna()))[:4]
+            logger.info(
+                "Covariate %s treated as BINARY: min=%.1f max=%.1f uniques~%s",
+                cov_name,
+                mn,
+                mx,
+                uniq,
+            )
         s.index = future_index  # ensure identical index object
         return s
 
@@ -1414,19 +1580,26 @@ async def run_sensor_job(sensor: SensorCfg,
 
         # lagged covariates (including both)
         for cov in list(dict.fromkeys(list(sensor.covariates_lagged) + list(sensor.covariates_both))):
-            s = await cov_res.get_hist_series(cov, start_hist, end_hist, freq, agg)
+            s = await cov_res.get_hist_series(cov, start_hist, end_hist, freq, agg, sensor_cfg=sensor)
             if not s.empty:
                 train_df = train_df.merge(s.rename(cov), left_on="ds", right_index=True, how="left")
                 logger.debug(
                     "Covariate %s lagged: merged %s rows", cov, len(s)
                 )
-                backend.add_lagged_regressor(cov, n_lags=n_lags_eff)
+                n_lags_for_cov = _lags_for_covariate(cov, n_lags_eff, sensor)
+                backend.add_lagged_regressor(cov, n_lags=n_lags_for_cov)
+                logger.info(
+                    "Added lagged regressor %s with n_lags=%d (binary=%s)",
+                    cov,
+                    n_lags_for_cov,
+                    is_binary_cov_name(cov, sensor),
+                )
             else:
                 logger.debug("Covariate %s lagged: no history.", cov)
 
         # future covariates (including both)
         for cov in list(dict.fromkeys(list(sensor.covariates_future) + list(sensor.covariates_both))):
-            s = await cov_res.get_hist_series(cov, start_hist, end_hist, freq, agg)
+            s = await cov_res.get_hist_series(cov, start_hist, end_hist, freq, agg, sensor_cfg=sensor)
             if not s.empty:
                 train_df = train_df.merge(s.rename(cov), left_on="ds", right_index=True, how="left")
                 logger.debug(
@@ -1484,9 +1657,30 @@ async def run_sensor_job(sensor: SensorCfg,
         fut_idx = pd.DatetimeIndex(df_future.loc[df_future["ds"] > last_ts, "ds"])
         fut_names = [c for c in (list(sensor.covariates_future) + list(sensor.covariates_both)) if c in cov_cols]
         for cov in fut_names:
-            s = await cov_res.get_future_series(cov, fut_idx, default=0.0)
+            s = await cov_res.get_future_series(cov, fut_idx, default=0.0, sensor_cfg=sensor)
+            bin_cfg = is_binary_cov_name(cov, sensor)
+            bin_auto = is_binary_like(s)
+            is_bin = bool(bin_cfg or bin_auto)
+            s = resample_covariate(s, freq, is_binary=is_bin)
+            logger.debug(
+                "Covariate %s: binary=%s (cfg=%s auto=%s) rows=%d",
+                cov,
+                is_bin,
+                bin_cfg,
+                bin_auto,
+                len(s),
+            )
+            if is_bin:
+                mn, mx = float(s.min()), float(s.max())
+                uniq = sorted(pd.unique(s.dropna()))[:4]
+                logger.info(
+                    "Covariate %s treated as BINARY: min=%.1f max=%.1f uniques~%s",
+                    cov,
+                    mn,
+                    mx,
+                    uniq,
+                )
             cov_df = s.rename(cov).reset_index().rename(columns={"index": "ds"})
-            cov_df = _complete_grid_after_resample(cov_df, freq=freq, how="mean", ds_col="ds", val_col=cov)
             df_future = df_future.merge(cov_df, on="ds", how="left")
         for name in cov_cols:
             if name in df_future:
