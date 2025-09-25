@@ -61,6 +61,11 @@ DEFAULT_HORIZONS_MIN = [120, 480, 720]  # +2h, +8h, +12h
 
 SAFE_TBL_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
+MAX_FFILL_HOURS = 12            # limit for carry-forward during gaps
+COV_MIN_COVERAGE = 0.50         # drop covariate if coverage below this in window
+MIN_TRAIN_WINDOWS_FACTOR = 2.0  # require at least 2*(n_lags+n_forecasts) rows
+SKIP_KEEP_LAST_MSG = "Coverage too low or target degenerate; skipping train/predict this cycle."
+
 # --------------------------------------------------------------------------- #
 # Logging
 # --------------------------------------------------------------------------- #
@@ -100,58 +105,56 @@ def summarise_df(tag: str, df: pd.DataFrame):
 
 # --- Gap-aware cumulative → interval conversion ---
 
-def _cum_to_interval_gap_aware_single_day(s: pd.Series, freq: str) -> pd.Series:
+def _regular_index(start_ts: pd.Timestamp, end_ts: pd.Timestamp, freq_str: str) -> pd.DatetimeIndex:
+    return pd.date_range(start=start_ts, end=end_ts, freq=freq_str, tz="UTC")
+
+
+def _gap_aware_cum_to_interval(
+    df_raw: pd.DataFrame,
+    ts_col: str = "ts",
+    val_col: str = "val",
+    freq_minutes: int = 30,
+    reset_daily: bool = True,
+    cushion=None,
+) -> pd.DataFrame:
     """
-    s: cumulative values for a single day (sorted, tz-aware or naive)
-    Returns interval increments on a regular freq grid, distributing gaps.
+    df_raw: columns [ts,val] UTC; 'val' is cumulative percentage for the day (0..100 or similar).
+    Returns a DataFrame with regular 30min 'ds' and interval 'y' (>=0), gap periods become 0.
     """
-    if s is None or s.empty:
-        return pd.Series(dtype="float32")
-    # keep finite & sorted
-    s = s[pd.notna(s)].sort_index()
-    if s.empty:
-        return pd.Series(dtype="float32")
-    # Interpolate cumulative to the regular grid, then edge-diff
-    grid = s.resample(freq).interpolate("time")  # linear interpolation over gaps
-    y = grid.diff().fillna(0.0).clip(lower=0.0)
-    return y.astype("float32")
+    if df_raw.empty:
+        return pd.DataFrame(columns=["ds", "y"])
+    freq_str = f"{freq_minutes}min"
 
+    # Build regular grid over observed span
+    ds_start = df_raw[ts_col].min()
+    ds_end = df_raw[ts_col].max()
+    grid = _regular_index(ds_start, ds_end, freq_str)
+    s = df_raw.set_index(ts_col)[val_col].sort_index()
 
-def cum_to_interval_gap_aware(cum: pd.Series, freq: str, reset_daily: bool = False, tz: str | None = None) -> pd.Series:
-    """
-    Convert cumulative series to interval series on a regular grid.
-    If reset_daily=True, operate within each local day separately.
-    """
-    if cum is None or len(cum) == 0:
-        # still return an empty grid (caller typically resamples later)
-        return pd.Series(dtype="float32")
+    # Limited forward-fill/backfill to represent plateaus during short outages
+    limit = int((MAX_FFILL_HOURS * 60) // freq_minutes)
+    s = s.reindex(grid)
+    s = s.ffill(limit=limit).bfill(limit=1)  # small backfill for left edge only
 
-    s = cum[pd.notna(cum)].sort_index()
-    if s.empty:
-        return pd.Series(dtype="float32")
+    # If daily reset, ensure non-decreasing within each day, then diff within day
+    # We allow small negative jitter but clip below 0 after differencing.
+    s_day = s.copy()
+    if reset_daily:
+        # Enforce same-day monotonic non-decreasing by cumulative max per day
+        day_idx = s_day.index.tz_convert("UTC").normalize()
+        s_day = s_day.groupby(day_idx).cummax()
 
-    # Optional: enforce non-decreasing within a day (comment out if not desired)
-    # s = s.cummax()
+    # Interval by within-day diff
+    y = s_day.diff()
+    # New day: allow negative (wrap to 0), else clip negatives to 0 (jitters)
+    is_new_day = s_day.index.normalize() != s_day.index.shift(1).normalize()
+    y[is_new_day] = 0.0
+    y = y.clip(lower=0.0)
 
-    if not reset_daily:
-        return _cum_to_interval_gap_aware_single_day(s, freq)
-
-    # Daily mode: split by local day, interpolate per-day, then concat
-    idx = s.index
-    if getattr(idx, "tz", None) is not None and tz is not None:
-        day_keys = idx.tz_convert(tz).normalize()
-    else:
-        # fall back to existing timezone or naive midnights
-        day_keys = idx.normalize()
-
-    parts = []
-    for _, part in s.groupby(day_keys, sort=True):
-        y_part = _cum_to_interval_gap_aware_single_day(part, freq)
-        parts.append(y_part)
-    if not parts:
-        return pd.Series(dtype="float32")
-    y = pd.concat(parts).sort_index()
-    return y.astype("float32")
+    out = pd.DataFrame({"ds": s_day.index, "y": y.values})
+    # Drop leading NaN from first diff
+    out = out.dropna(subset=["y"]).reset_index(drop=True)
+    return out
 
 
 def clip_outliers_quantile(s, q: float = 0.995, positive_only: bool = True):
@@ -244,81 +247,6 @@ def cumulative_to_interval_daily(raw_df: pd.DataFrame,
     return out
 
 
-def resample_intervals_sum(df: pd.DataFrame,
-                           ts_col: str = "ts",
-                           y_col: str = "y",
-                           freq: str = "30min") -> pd.DataFrame:
-    """
-    Resample an interval series to fixed cadence by sum.
-    Missing bins become 0 (no forward fill).
-    Returns columns ['ds','y'].
-    """
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["ds", "y"])
-    x = df.set_index(ts_col)[y_col].astype("float32")
-    y = x.resample(freq).sum().asfreq(freq, fill_value=0.0).astype("float32")
-    return y.reset_index().rename(columns={ts_col: "ds", y_col: "y"})
-
-
-def cumulative_to_interval_naive_fallback(raw_df: pd.DataFrame,
-                                          resample_freq: str = "30min") -> pd.DataFrame:
-    """
-    Prior behavior: simple diff across entire series, negatives -> 0, then resample by sum.
-    """
-    if raw_df is None or raw_df.empty:
-        return pd.DataFrame(columns=["ds", "y"])
-    df = raw_df[["ts", "val"]].dropna().copy()
-    if df.empty:
-        return pd.DataFrame(columns=["ds", "y"])
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-    df = df.sort_values("ts")
-    diff = df["val"].astype("float32").diff().fillna(0.0)
-    diff = diff.mask(diff < 0.0, 0.0).astype("float32")
-    intervals = pd.DataFrame({"ts": df["ts"], "y": diff})
-    y30 = resample_intervals_sum(intervals, ts_col="ts", y_col="y", freq=resample_freq)
-    pos_after = int((y30["y"] > 0).sum())
-    nonzero_share = 100.0 * pos_after / max(1, len(y30))
-    logging.info("Naive diff result rows=%d; positive buckets=%d (%.2f%%); y.max=%.3f; y.sum=%.3f",
-                 len(y30), pos_after, nonzero_share, float(y30["y"].max()), float(y30["y"].sum()))
-    return y30
-
-
-def cumulative_to_interval_gapaware_with_daily(raw_df: pd.DataFrame,
-                                               entity_id: str,
-                                               unit: str | None,
-                                               state_class: str | None,
-                                               cfg,
-                                               resample_freq: str = "30min") -> pd.DataFrame:
-    """
-    Preferred path for sensors like '*…today*' with total_increasing semantics:
-      1) daily segmentation diff → intervals
-      2) resample by sum to fixed cadence
-      3) if result is all zeros, fall back to naive diff+resample (with warning)
-    """
-    tz = _get_local_tz(cfg)
-    # Decide whether to try daily segmentation first
-    if is_daily_cumulative_sensor(entity_id, unit, state_class):
-        logging.debug("Cumulative->interval(daily) on %d rows (entity=%s, tz=%s)",
-                      0 if raw_df is None else len(raw_df), entity_id, tz)
-        intervals = cumulative_to_interval_daily(raw_df, ts_col="ts", val_col="val", local_tz=tz)
-        pos_before = int((intervals["y"] > 0).sum()) if not intervals.empty else 0
-        logging.debug("Daily-seg: positives before resample=%d / %d", pos_before, 0 if intervals is None else len(intervals))
-
-        y30 = resample_intervals_sum(intervals, ts_col="ts", y_col="y", freq=resample_freq)
-        pos_after = int((y30["y"] > 0).sum()) if not y30.empty else 0
-        nonzero_share = 100.0 * pos_after / max(1, len(y30))
-        logging.info("Daily-seg result rows=%d; positive buckets=%d (%.2f%%); y.max=%.3f; y.sum=%.3f",
-                     len(y30), pos_after, nonzero_share,
-                     float(0 if y30.empty else y30["y"].max()),
-                     float(0 if y30.empty else y30["y"].sum()))
-
-        if pos_after == 0:
-            logging.warning("Daily-seg produced all zeros; falling back to naive diff.")
-            return cumulative_to_interval_naive_fallback(raw_df, resample_freq=resample_freq)
-        return y30
-
-    # Otherwise, use the naive path directly
-    return cumulative_to_interval_naive_fallback(raw_df, resample_freq=resample_freq)
 
 
 # --------------------------------------------------------------------------- #
@@ -882,26 +810,32 @@ def is_binary_like(series: pd.Series, min_obs: int = 20) -> bool:
     uniq = pd.unique(x.round(6))
     return set(np.round(uniq, 6)).issubset({0.0, 1.0})
 
-def coerce_to_binary(series: pd.Series) -> pd.Series:
-    """Force strict 0/1 without NaNs (ffill/bfill/0)."""
-    x = _to_numeric_or_bool(series)
-    if x.dropna().between(0.0, 1.0).all():
-        x = (x.fillna(method="ffill").fillna(method="bfill").fillna(0.0) > 0.5).astype(float)
-    else:
-        x = x.round().clip(0, 1).astype(float)
-    return x
-
-def resample_covariate(series: pd.Series, freq: str, *, is_binary: bool) -> pd.Series:
-    """Resample: binary uses step (ffill); continuous uses mean."""
-    s = series.sort_index()
+def _resample_and_fill_covariate(
+    s: pd.Series, freq_minutes: int, is_binary: bool, tz="UTC"
+) -> pd.Series:
+    """Resample to cadence and limited-ffill/backfill. Binary covariates are thresholded to {0,1} after fill."""
+    if s.empty:
+        return s
+    s = s.sort_index()
+    freq_str = f"{freq_minutes}min"
+    # Resample: mean for continuous, max (or last) for binary to avoid smoothing spikes
     if is_binary:
-        s = coerce_to_binary(s)
-        s = s.resample(freq).ffill()
-        s = s.ffill().bfill().fillna(0.0)
-        s = s.clip(0, 1).round().astype(float)
+        # use last then threshold (max can 'stick' a 1 too eagerly); last is closer to HA behavior
+        s = s.resample(freq_str).last()
     else:
-        s = s.resample(freq).mean()
+        s = s.resample(freq_str).mean()
+
+    limit = int((MAX_FFILL_HOURS * 60) // freq_minutes)
+    s = s.ffill(limit=limit).bfill(limit=1)
+    if is_binary:
+        s = (s.fillna(0.0) > 0.5).astype(float)
     return s
+
+
+def _coverage_ratio(s: pd.Series) -> float:
+    if s is None or len(s) == 0:
+        return 0.0
+    return float(s.notna().sum()) / float(len(s))
 
 def is_binary_cov_name(name: str, sensor_cfg) -> bool:
     cfg_list = set(sensor_cfg.covariates_binary or [])
@@ -1024,6 +958,36 @@ def build_future_from_train_index(train_df: pd.DataFrame,
 
     return pd.DataFrame({"ds": idx})
 
+
+def _ok_to_train(train_df: pd.DataFrame, n_lags: int, n_forecasts: int, logger) -> bool:
+    # sufficient rows
+    need = int(MIN_TRAIN_WINDOWS_FACTOR * (n_lags + n_forecasts))
+    if len(train_df) < need:
+        logger.error("%s (rows=%d, need>=%d)", SKIP_KEEP_LAST_MSG, len(train_df), need)
+        return False
+    # non-degenerate target
+    y = train_df["y"].astype(float)
+    if y.nunique(dropna=True) <= 1 or np.allclose(y.values, y.values[0], equal_nan=False):
+        logger.error("%s (target singular)", SKIP_KEEP_LAST_MSG)
+        return False
+    return True
+
+
+def _filter_future_columns_for_model(df_future: pd.DataFrame, model) -> pd.DataFrame:
+    # NeuralProphet stores known regressors in model.config_covar / config_lagged_regressors
+    keep = {"ds", "y"}
+    try:
+        # lagged regressors:
+        if hasattr(model, "config_lagged_regressors") and model.config_lagged_regressors is not None:
+            keep.update(model.config_lagged_regressors.regressors.keys())
+        # known future/regular regressors (if any):
+        if hasattr(model, "config_regressors") and model.config_regressors is not None:
+            keep.update(model.config_regressors.regressors.keys())
+    except Exception:
+        pass
+    cols = [c for c in df_future.columns if c in keep]
+    return df_future[cols].copy()
+
 # --------------------------------------------------------------------------- #
 # CovariateResolver
 # --------------------------------------------------------------------------- #
@@ -1099,12 +1063,19 @@ class CovariateResolver:
             }
 
         cov_series = df.set_index("ds")["value"]
+        cov_series = pd.to_numeric(cov_series, errors="coerce")
+
+        freq_minutes = int(max(1, pd.Timedelta(freq).total_seconds() // 60))
+        scaled_probe = _resample_and_fill_covariate(cov_series, freq_minutes, is_binary=False)
 
         bin_cfg = is_binary_cov_name(cov_name, sensor_cfg) if sensor_cfg else False
-        bin_auto = is_binary_like(cov_series)
+        bin_auto = is_binary_like(scaled_probe)
         is_bin = bool(bin_cfg or bin_auto)
 
-        cov_series = resample_covariate(cov_series, freq, is_binary=is_bin)
+        if is_bin:
+            cov_series = _resample_and_fill_covariate(cov_series, freq_minutes, is_binary=True)
+        else:
+            cov_series = scaled_probe
 
         if cov_series.empty:
             logger.warning("Covariate %s dropped: empty after resample/alignment.", cov_name)
@@ -1115,6 +1086,28 @@ class CovariateResolver:
                 "df": None,
                 "reason": "empty_after_resample",
             }
+
+        cov_ratio = _coverage_ratio(cov_series)
+        if cov_ratio < COV_MIN_COVERAGE:
+            logger.info(
+                "Covariate %s: coverage=%.1f%%, dropped (<%.0f%%)",
+                cov_name,
+                cov_ratio * 100.0,
+                COV_MIN_COVERAGE * 100.0,
+            )
+            return {
+                "name": cov_name,
+                "used": False,
+                "binary": bool(is_bin),
+                "df": None,
+                "reason": "coverage_low",
+            }
+        else:
+            logger.info(
+                "Covariate %s: coverage=%.1f%%, kept",
+                cov_name,
+                cov_ratio * 100.0,
+            )
 
         aligned_rows = len(cov_series)
         if n_lags_required is not None:
@@ -1175,6 +1168,7 @@ class CovariateResolver:
             "name": cov_name,
             "used": True,
             "binary": bool(is_bin),
+            "coverage": cov_ratio,
             "df": out,
             "reason": None,
         }
@@ -1184,7 +1178,50 @@ class CovariateResolver:
         entity_id = meta["entity"]
         scale = float(meta.get("scale", 1.0))
         attr_name = meta.get("forecast_attr")
-    
+        bin_cfg = is_binary_cov_name(cov_name, sensor_cfg) if sensor_cfg else False
+
+        freq_minutes = 30
+        if len(future_index) >= 2:
+            delta = (future_index[1] - future_index[0]).total_seconds() / 60.0
+            if delta > 0:
+                freq_minutes = int(delta)
+        freq_minutes = max(1, int(freq_minutes))
+
+        def _finalise(raw: pd.Series) -> pd.Series:
+            raw = raw.copy()
+            raw.index = pd.to_datetime(raw.index, utc=True)
+            probe = _resample_and_fill_covariate(pd.to_numeric(raw, errors="coerce"), freq_minutes, is_binary=False)
+            bin_auto = is_binary_like(probe)
+            is_bin = bool(bin_cfg or bin_auto)
+            if is_bin:
+                final = _resample_and_fill_covariate(pd.to_numeric(raw, errors="coerce"), freq_minutes, is_binary=True)
+            else:
+                final = probe * scale
+            final = final.reindex(future_index).ffill(limit=1).bfill(limit=1)
+            logger.debug(
+                "Covariate %s future: binary=%s (cfg=%s auto=%s) rows=%d",
+                cov_name,
+                is_bin,
+                bin_cfg,
+                bin_auto,
+                len(final),
+            )
+            if is_bin:
+                mn, mx = float(final.min()), float(final.max())
+                uniq = sorted(pd.unique(final.dropna()))[:4]
+                logger.info(
+                    "Covariate %s treated as BINARY: min=%.1f max=%.1f uniques~%s",
+                    cov_name,
+                    mn,
+                    mx,
+                    uniq,
+                )
+                final = final.fillna(0.0)
+            else:
+                final = final.fillna(float(default))
+            final.index = future_index
+            return final
+
         # If no forecast attribute is configured, fall back to current-state constant
         if not attr_name:
             val = await self.iface.get_state(entity_id)
@@ -1193,36 +1230,11 @@ class CovariateResolver:
             except (TypeError, ValueError):
                 v = float(default)
             s = pd.Series(v, index=future_index)
-            bin_cfg = is_binary_cov_name(cov_name, sensor_cfg) if sensor_cfg else False
-            bin_auto = is_binary_like(s)
-            is_bin = bool(bin_cfg or bin_auto)
-            if is_bin:
-                s = coerce_to_binary(s)
-            else:
-                s = s * scale
-            logger.debug(
-                "Covariate %s future: binary=%s (cfg=%s auto=%s) rows=%d",
-                cov_name,
-                is_bin,
-                bin_cfg,
-                bin_auto,
-                len(s),
-            )
-            if is_bin:
-                mn, mx = float(s.min()), float(s.max())
-                uniq = sorted(pd.unique(s.dropna()))[:4]
-                logger.info(
-                    "Covariate %s treated as BINARY: min=%.1f max=%.1f uniques~%s",
-                    cov_name,
-                    mn,
-                    mx,
-                    uniq,
-                )
-            return s
-    
+            return _finalise(s)
+
         # 1) Fetch future series payload from HA
         payload = await self.iface.get_state(entity_id, attribute=attr_name) or []
-    
+
         # 2) Normalise: handle both point forecasts and [start, end) intervals
         df = pd.DataFrame(payload)
     
@@ -1237,40 +1249,15 @@ class CovariateResolver:
             val_col = value_col_candidates[0]
         else:
             val_col = next((c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])), None)
-    
+
         if val_col is None:
             # Nothing numeric -> fill defaults
             s = pd.Series(float(default), index=future_index)
-            bin_cfg = is_binary_cov_name(cov_name, sensor_cfg) if sensor_cfg else False
-            bin_auto = is_binary_like(s)
-            is_bin = bool(bin_cfg or bin_auto)
-            if is_bin:
-                s = coerce_to_binary(s)
-            else:
-                s = s * scale
-            logger.debug(
-                "Covariate %s future: binary=%s (cfg=%s auto=%s) rows=%d",
-                cov_name,
-                is_bin,
-                bin_cfg,
-                bin_auto,
-                len(s),
-            )
-            if is_bin:
-                mn, mx = float(s.min()), float(s.max())
-                uniq = sorted(pd.unique(s.dropna()))[:4]
-                logger.info(
-                    "Covariate %s treated as BINARY: min=%.1f max=%.1f uniques~%s",
-                    cov_name,
-                    mn,
-                    mx,
-                    uniq,
-                )
-            return s
+            return _finalise(s)
 
         # Convert the model’s index to a DataFrame for joining
         target = pd.DataFrame({"ds": pd.to_datetime(future_index, utc=True)}).sort_values("ds")
-    
+
         if time_keys_point:
             # --- Point forecasts: nearest-time match with a sensible tolerance ---
             dfp = df[[time_keys_point[0], val_col]].rename(columns={time_keys_point[0]: "ds", val_col: "value"})
@@ -1302,37 +1289,11 @@ class CovariateResolver:
         else:
             # Unknown shape: just fill default
             out = pd.Series(float(default), index=target.index)
-    
+
         # 3) Scale / coerce binary, fill gaps deterministically, and return with the original index
         s = pd.to_numeric(out, errors="coerce")
-        bin_cfg = is_binary_cov_name(cov_name, sensor_cfg) if sensor_cfg else False
-        bin_auto = is_binary_like(s)
-        is_bin = bool(bin_cfg or bin_auto)
-        if is_bin:
-            s = coerce_to_binary(s)
-        else:
-            s = s * scale
-            s = s.ffill().fillna(float(default))
-        logger.debug(
-            "Covariate %s future: binary=%s (cfg=%s auto=%s) rows=%d",
-            cov_name,
-            is_bin,
-            bin_cfg,
-            bin_auto,
-            len(s),
-        )
-        if is_bin:
-            mn, mx = float(s.min()), float(s.max())
-            uniq = sorted(pd.unique(s.dropna()))[:4]
-            logger.info(
-                "Covariate %s treated as BINARY: min=%.1f max=%.1f uniques~%s",
-                cov_name,
-                mn,
-                mx,
-                uniq,
-            )
-        s.index = future_index  # ensure identical index object
-        return s
+        s.index = target["ds"].values
+        return _finalise(s)
 
 # --------------------------------------------------------------------------- #
 # Model Backend (NeuralProphet)
@@ -1387,6 +1348,7 @@ class NPBackend:
         return self.model.make_future_dataframe(**kw)
 
     def predict(self, df_future: pd.DataFrame) -> pd.DataFrame:
+        df_future = _filter_future_columns_for_model(df_future, self.model)
         return self.model.predict(df_future)
 
 
@@ -1731,6 +1693,10 @@ async def run_sensor_job(sensor: SensorCfg,
             sensor.units or "",
         )
 
+    if len(df) < 3:
+        logger.error("%s (normalized history rows=%d)", SKIP_KEEP_LAST_MSG, len(df))
+        return
+
     # DB merge
     if sensor.database and db:
         tname = sensor.name.replace(".", "_")
@@ -1757,36 +1723,27 @@ async def run_sensor_job(sensor: SensorCfg,
     agg = sensor.effective_aggregation(role_cfg)      # keep "sum" for energy
 
     # --------------------------------------------------
-    # 1.  Convert cumulative counter → interval (daily-aware)
+    # 1.  Convert cumulative counter → interval (gap-aware)
     # --------------------------------------------------
     if sensor.source_is_cumulative:
         raw_df = df.rename(columns={"ds": "ts", "value": "val"})[["ts", "val"]]
-        logging.debug("Cumulative->interval(gap-aware) on %d rows", len(raw_df))
-        _entity_id = getattr(sensor, "entity_id", getattr(sensor, "name", "unknown"))
-        _unit = getattr(sensor, "units", None)
-        _state_class = getattr(sensor, "state_class", None)
-
-        y30 = cumulative_to_interval_gapaware_with_daily(
-            raw_df=raw_df,
-            entity_id=_entity_id,
-            unit=_unit,
-            state_class=_state_class,
-            cfg=cfg,
-            resample_freq=freq,
+        raw_df["ts"] = pd.to_datetime(raw_df["ts"], utc=True)
+        logger.debug("Cumulative->interval(gap-aware) on %d rows", len(raw_df))
+        df_y = _gap_aware_cum_to_interval(
+            raw_df,
+            ts_col="ts",
+            val_col="val",
+            freq_minutes=interval_min,
+            reset_daily=sensor.reset_daily,
         )
-        logging.info(
-            "Sensor %s: after daily-aware conversion %d rows from %s",
-            _entity_id,
-            len(y30),
-            freq,
-        )
+        logger.debug("Cumulative->interval result rows=%d", len(df_y))
+        if df_y.empty:
+            logger.error("%s (gap-aware conversion produced 0 rows)", SKIP_KEEP_LAST_MSG)
+            return
 
-        # --- Outlier capping on interval y (safe, positives-only) ---
         outlier_q = getattr(sensor, "outlier_cap_q", 0.995)
-
         if outlier_q is not None:
-            # Compute cap from strictly-positive values only
-            y_series = y30["y"].astype("float32")
+            y_series = df_y["y"].astype("float32")
             pos = y_series[y_series > 0]
             nonzero_share = 100.0 * (len(pos) / max(1, len(y_series)))
             cap_val = float(pos.quantile(outlier_q)) if len(pos) > 0 else float("nan")
@@ -1800,20 +1757,14 @@ async def run_sensor_job(sensor: SensorCfg,
                     float(y_series.max()),
                     nonzero_share,
                 )
-                y30["y"] = y_series
+                df_y["y"] = y_series
             else:
                 logger.info(
                     "Outlier capping skipped (cap<=0 or insufficient positives). nonzero_share=%.2f%%",
                     nonzero_share,
                 )
 
-        # Guard: if preprocessing flattened the target, stop early to avoid NP crash.
-        if y30["y"].nunique(dropna=True) < 2:
-            msg = "Target became constant after preprocessing (likely extreme sparsity). Skipping training."
-            logger.error(msg)
-            return
-
-        df = y30
+        df = df_y
     else:
         # --------------------------------------------------
         # 2.  Resample the interval series (sum / mean / last)
@@ -1888,16 +1839,6 @@ async def run_sensor_job(sensor: SensorCfg,
                     sensor.name, n_lags_eff,
                     "auto" if (isinstance(sensor.n_lags or role_cfg.n_lags, str)
                                and str(sensor.n_lags or role_cfg.n_lags).lower()=="auto") else "fixed")
-
-        # Now that we know the effective n_lags, do a proper history sufficiency check
-        min_needed = n_lags_eff + steps + 1
-        if len(train_df) < min_needed:
-            logger.warning(
-                "Sensor %s: insufficient history for n_lags=%s & steps=%s "
-                "(have %s rows, need ≥ %s); skipping model.",
-                sensor.name, n_lags_eff, steps, len(train_df), min_needed
-            )
-            return
 
         backend = NPBackend(
             n_lags=n_lags_eff,
@@ -1992,7 +1933,8 @@ async def run_sensor_job(sensor: SensorCfg,
         cov_cols = sorted(set(lagged_used_names + future_used_names))
         if cov_cols:
             # Forward-fill then back-fill
-            train_df[cov_cols] = train_df[cov_cols].ffill().bfill()
+            limit = int((MAX_FFILL_HOURS * 60) // interval_min)
+            train_df[cov_cols] = train_df[cov_cols].ffill(limit=limit).bfill(limit=1)
             # If any NAs remain (e.g., covariate starts late), fill with column medians
             if train_df[cov_cols].isna().any().any():
                 med = train_df[cov_cols].median(numeric_only=True)
@@ -2023,6 +1965,9 @@ async def run_sensor_job(sensor: SensorCfg,
             float(0 if train_df.empty else train_df["y"].sum()),
         )
 
+        if not _ok_to_train(train_df, n_lags_eff, steps, logger):
+            return
+
         # Fit
         backend.fit(train_df, freq=freq)
         logger.info("Sensor %s: model trained", sensor.name)
@@ -2049,33 +1994,12 @@ async def run_sensor_job(sensor: SensorCfg,
         fut_names = [c for c in (list(sensor.covariates_future) + list(sensor.covariates_both)) if c in cov_cols]
         for cov in fut_names:
             s = await cov_res.get_future_series(cov, fut_idx, default=0.0, sensor_cfg=sensor)
-            bin_cfg = is_binary_cov_name(cov, sensor)
-            bin_auto = is_binary_like(s)
-            is_bin = bool(bin_cfg or bin_auto)
-            s = resample_covariate(s, freq, is_binary=is_bin)
-            logger.debug(
-                "Covariate %s: binary=%s (cfg=%s auto=%s) rows=%d",
-                cov,
-                is_bin,
-                bin_cfg,
-                bin_auto,
-                len(s),
-            )
-            if is_bin:
-                mn, mx = float(s.min()), float(s.max())
-                uniq = sorted(pd.unique(s.dropna()))[:4]
-                logger.info(
-                    "Covariate %s treated as BINARY: min=%.1f max=%.1f uniques~%s",
-                    cov,
-                    mn,
-                    mx,
-                    uniq,
-                )
             cov_df = s.rename(cov).reset_index().rename(columns={"index": "ds"})
             df_future = df_future.merge(cov_df, on="ds", how="left")
         for name in cov_cols:
             if name in df_future:
-                df_future[name] = df_future[name].ffill().bfill(limit=1)
+                limit = int((MAX_FFILL_HOURS * 60) // interval_min)
+                df_future[name] = df_future[name].ffill(limit=limit).bfill(limit=1)
         _expected = len(df_future)
         for col in (["y"] if "y" in df_future.columns else []) + list(cov_cols):
             if col in df_future:
