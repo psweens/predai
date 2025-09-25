@@ -1058,16 +1058,7 @@ class CovariateResolver:
             }
         return {"entity": str(val), "scale": 1.0}
 
-    async def get_hist_series(
-        self,
-        cov_name: str,
-        start: datetime,
-        end: datetime,
-        freq: str,
-        how: str,
-        sensor_cfg: Optional[SensorCfg] = None,
-        n_lags_required: Optional[int] = None,
-    ) -> Dict[str, Any]:
+    async def get_hist_series(self, cov_name: str, start: datetime, end: datetime, freq: str, how: str, sensor_cfg: Optional[SensorCfg] = None) -> pd.Series:
         meta = self._resolve(cov_name)
         entity_id = meta["entity"]
         logger.debug(
@@ -1082,21 +1073,8 @@ class CovariateResolver:
         logger.debug(
             "Covariate %s: normalised history rows=%s", cov_name, len(df)
         )
-        n_rows_norm = len(df)
-        if n_rows_norm <= 1:
-            logger.warning(
-                "Covariate %s dropped: only %d row after normalization (needs > %d incl. n_lags alignment).",
-                cov_name,
-                n_rows_norm,
-                1,
-            )
-            return {
-                "name": cov_name,
-                "used": False,
-                "binary": False,
-                "df": None,
-                "reason": "insufficient_rows_norm",
-            }
+        if df.empty:
+            return pd.Series([], dtype=float)
 
         cov_series = df.set_index("ds")["value"]
 
@@ -1105,33 +1083,6 @@ class CovariateResolver:
         is_bin = bool(bin_cfg or bin_auto)
 
         cov_series = resample_covariate(cov_series, freq, is_binary=is_bin)
-
-        if cov_series.empty:
-            logger.warning("Covariate %s dropped: empty after resample/alignment.", cov_name)
-            return {
-                "name": cov_name,
-                "used": False,
-                "binary": bool(is_bin),
-                "df": None,
-                "reason": "empty_after_resample",
-            }
-
-        aligned_rows = len(cov_series)
-        if n_lags_required is not None:
-            if aligned_rows < (n_lags_required + 1):
-                logger.warning(
-                    "Covariate %s dropped: aligned rows=%d < (n_lags + 1)=%d.",
-                    cov_name,
-                    aligned_rows,
-                    (n_lags_required + 1),
-                )
-                return {
-                    "name": cov_name,
-                    "used": False,
-                    "binary": bool(is_bin),
-                    "df": None,
-                    "reason": "insufficient_rows_aligned",
-                }
 
         logger.debug(
             "Covariate %s: binary=%s (cfg=%s auto=%s) rows=%d",
@@ -1157,12 +1108,12 @@ class CovariateResolver:
             cov_series = cov_series * scale
             logger.debug("Covariate %s: scaled by %s", cov_name, scale)
 
-        out = cov_series.rename(cov_name).reset_index().rename(columns={"index": "ds"})
+        out = cov_series
         logger.info(
             "Covariate %s: min=%s max=%s %s",
             cov_name,
-            out[cov_name].min(),
-            out[cov_name].max(),
+            out.min(),
+            out.max(),
             meta.get("units", ""),
         )
         logger.debug(
@@ -1171,13 +1122,7 @@ class CovariateResolver:
         logger.debug(
             "Covariate %s: head=%s", cov_name, out.head().to_dict()
         )
-        return {
-            "name": cov_name,
-            "used": True,
-            "binary": bool(is_bin),
-            "df": out,
-            "reason": None,
-        }
+        return out
 
     async def get_future_series(self, cov_name: str, future_index: pd.DatetimeIndex, default: float = 0.0, sensor_cfg: Optional[SensorCfg] = None) -> pd.Series:
         meta = self._resolve(cov_name)
@@ -1908,88 +1853,44 @@ async def run_sensor_job(sensor: SensorCfg,
             country=sensor.country,
         )
 
-        cov_history_results: Dict[str, Dict[str, Any]] = {}
-        lagged_used_names: List[str] = []
-        future_used_names: List[str] = []
-
         # lagged covariates (including both)
         for cov in list(dict.fromkeys(list(sensor.covariates_lagged) + list(sensor.covariates_both))):
-            res = await cov_res.get_hist_series(
-                cov,
-                start_hist,
-                end_hist,
-                freq,
-                agg,
-                sensor_cfg=sensor,
-                n_lags_required=n_lags_eff,
-            )
-            cov_history_results[cov] = res
-            if not res.get("used"):
-                logger.info(
-                    "Skipping lagged regressor %s (used=False, reason=%s)",
-                    cov,
-                    res.get("reason"),
+            s = await cov_res.get_hist_series(cov, start_hist, end_hist, freq, agg, sensor_cfg=sensor)
+            if not s.empty:
+                train_df = train_df.merge(s.rename(cov), left_on="ds", right_index=True, how="left")
+                logger.debug(
+                    "Covariate %s lagged: merged %s rows", cov, len(s)
                 )
-                continue
-            df_cov = res.get("df")
-            if df_cov is None or df_cov.empty:
+                is_binary = bool(is_binary_cov_name(cov, sensor) or is_binary_like(s))
+                n_lags_for_cov = _lags_for_covariate(cov, n_lags_eff, sensor)
+                backend.add_lagged_regressor(cov, n_lags=n_lags_for_cov)
                 logger.info(
-                    "Skipping lagged regressor %s (df rows < n_lags+1).",
+                    "Added lagged regressor %s with n_lags=%d (binary=%s)",
                     cov,
+                    n_lags_for_cov,
+                    is_binary,
                 )
-                continue
-            train_df = train_df.merge(df_cov, on="ds", how="left")
-            logger.debug(
-                "Covariate %s lagged: merged %s rows", cov, len(df_cov)
-            )
-            is_binary = bool(res.get("binary", False))
-            n_lags_for_cov = _lags_for_covariate(cov, n_lags_eff, sensor)
-            backend.add_lagged_regressor(cov, n_lags=n_lags_for_cov)
-            logger.info(
-                "Added lagged regressor %s with n_lags=%d (binary=%s)",
-                cov,
-                n_lags_for_cov,
-                is_binary,
-            )
-            lagged_used_names.append(cov)
+            else:
+                logger.debug("Covariate %s lagged: no history.", cov)
 
         # future covariates (including both)
         for cov in list(dict.fromkeys(list(sensor.covariates_future) + list(sensor.covariates_both))):
-            res = cov_history_results.get(cov)
-            if res is None:
-                res = await cov_res.get_hist_series(
-                    cov,
-                    start_hist,
-                    end_hist,
-                    freq,
-                    agg,
-                    sensor_cfg=sensor,
-                    n_lags_required=None,
-                )
-                cov_history_results[cov] = res
-            if not res.get("used"):
-                logger.info(
-                    "Skipping future regressor %s (used=False, reason=%s)",
-                    cov,
-                    res.get("reason"),
-                )
-                continue
-            df_cov = res.get("df")
-            if df_cov is None or df_cov.empty:
-                logger.info(
-                    "Skipping future regressor %s (no aligned history).",
-                    cov,
-                )
-                continue
-            if cov not in train_df.columns:
-                train_df = train_df.merge(df_cov, on="ds", how="left")
+            s = await cov_res.get_hist_series(cov, start_hist, end_hist, freq, agg, sensor_cfg=sensor)
+            if not s.empty:
+                train_df = train_df.merge(s.rename(cov), left_on="ds", right_index=True, how="left")
                 logger.debug(
-                    "Covariate %s future: merged %s rows", cov, len(df_cov)
+                    "Covariate %s future: merged %s rows", cov, len(s)
                 )
+            else:
+                train_df[cov] = np.nan
+                logger.debug("Covariate %s future: no history, filled NaN", cov)
             backend.add_future_regressor(cov, mode="additive")
-            future_used_names.append(cov)
 
-        cov_cols = sorted(set(lagged_used_names + future_used_names))
+        # ensure regressor columns exist even if HA returned no history
+        cov_cols = list(dict.fromkeys(list(sensor.covariates_lagged) + list(sensor.covariates_future) + list(sensor.covariates_both)))
+        for cov in cov_cols:
+            if cov not in train_df.columns:
+                train_df[cov] = 0.0
         if cov_cols:
             # Forward-fill then back-fill
             train_df[cov_cols] = train_df[cov_cols].ffill().bfill()
@@ -1999,12 +1900,6 @@ async def run_sensor_job(sensor: SensorCfg,
                 train_df[cov_cols] = train_df[cov_cols].fillna(med)
             # Final safety net
             train_df[cov_cols] = train_df[cov_cols].fillna(0.0)
-
-        logger.info(
-            "Covariates used this cycle (lagged=%s, future=%s)",
-            lagged_used_names,
-            future_used_names,
-        )
 
         train_df = train_df.dropna(subset=["y"])
         _delta = train_df["ds"].diff().dropna().value_counts()
@@ -2087,10 +1982,7 @@ async def run_sensor_job(sensor: SensorCfg,
                     sensor.name, len(df_future),
                     (not deltas.empty and deltas.index[0] == pd.Timedelta(minutes=30)),
                     list(df_future['ds'].head(3)), list(df_future['ds'].tail(3)))
-        np_cols = [c for c in (["ds", "y"] + cov_cols) if c in df_future.columns]
-        df_np = df_future[np_cols].copy()
-        logger.debug("NP predict input columns: %s", list(df_np.columns))
-        fcst = backend.predict(df_np)
+        fcst = backend.predict(df_future)
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
         summarise_df(f"forecast.{sensor.name}", fcst)
 
