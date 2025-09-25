@@ -154,6 +154,34 @@ def _gap_aware_cum_to_interval(
     out = pd.DataFrame({"ds": s_day.index, "y": y.values})
     # Drop leading NaN from first diff
     out = out.dropna(subset=["y"]).reset_index(drop=True)
+
+    # --- BEGIN enforce regular cadence on interval series ---
+    out = out.sort_values('ds').drop_duplicates(subset=['ds'], keep='last')
+    if out.empty:
+        return out
+    _tz = out['ds'].dt.tz
+    start_ds = out['ds'].min()
+    end_ds = out['ds'].max()
+    start30 = (start_ds.floor('30min') if hasattr(start_ds, 'floor') else start_ds)
+    end30 = (end_ds.ceil('30min')    if hasattr(end_ds, 'ceil')   else end_ds)
+    idx = pd.date_range(start=start30, end=end30, freq=f"{freq_minutes}min", tz=_tz)
+
+    s = (
+        out.set_index('ds')['y']
+        .groupby(pd.Grouper(freq=f'{freq_minutes}min'))
+        .sum(min_count=1)
+    )
+
+    s = s.reindex(idx).fillna(0.0)
+    s = s.rename('y')
+    out = s.reset_index().rename(columns={'index': 'ds'})
+    # --- END enforce regular cadence on interval series ---
+    logger.debug(
+        "Interval series regularised: rows=%d, span=%s→%s",
+        len(out),
+        out['ds'].min(),
+        out['ds'].max(),
+    )
     return out
 
 
@@ -2023,8 +2051,16 @@ async def run_sensor_job(sensor: SensorCfg,
         )
 
         train_df = train_df.dropna(subset=["y"])
-        _delta = train_df["ds"].diff().dropna().value_counts()
-        assert not _delta.empty and _delta.index[0] == pd.Timedelta(minutes=30), f"Cadence not 30min: {dict(_delta)}"
+        _delta_counts = train_df.set_index("ds").index.to_series().diff().value_counts(dropna=True)
+        if not (
+            len(_delta_counts) == 1
+            and _delta_counts.index[0] == pd.Timedelta(minutes=interval_min)
+        ):
+            logger.warning(
+                "Cadence still irregular after reindex (unexpected). Counts=%s",
+                dict(_delta_counts),
+            )
+            raise RuntimeError("Cadence irregular even after repair; skipping this cycle.")
 
         # Log a summary after imputation
         summarise_df(f"train_imputed.{sensor.name}", train_df)
