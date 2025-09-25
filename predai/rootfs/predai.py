@@ -123,65 +123,72 @@ def _gap_aware_cum_to_interval(
     """
     if df_raw.empty:
         return pd.DataFrame(columns=["ds", "y"])
-    freq_str = f"{freq_minutes}min"
+    interval = freq_minutes
+    df = df_raw.rename(columns={ts_col: "ds", val_col: "y"}).copy()
+    df["ds"] = pd.to_datetime(df["ds"], utc=True)
 
-    # Build regular grid over observed span
-    ds_start = df_raw[ts_col].min()
-    ds_end = df_raw[ts_col].max()
-    grid = _regular_index(ds_start, ds_end, freq_str)
-    s = df_raw.set_index(ts_col)[val_col].sort_index()
+    df = df.sort_values("ds").drop_duplicates(subset=["ds"], keep="last")
+    if df.empty:
+        return pd.DataFrame(columns=["ds", "y"])
 
-    # Limited forward-fill/backfill to represent plateaus during short outages
-    limit = int((MAX_FFILL_HOURS * 60) // freq_minutes)
-    s = s.reindex(grid)
-    s = s.ffill(limit=limit).bfill(limit=1)  # small backfill for left edge only
+    _tz = df["ds"].dt.tz
 
-    # If daily reset, ensure non-decreasing within each day, then diff within day
-    # We allow small negative jitter but clip below 0 after differencing.
-    s_day = s.copy()
+    # 1) Build a strict 30-min grid that spans the data
+    start_ds = df["ds"].min()
+    end_ds = df["ds"].max()
+    start30 = start_ds.floor("30min")
+    end30 = end_ds.ceil("30min")
+    idx = pd.date_range(start=start30, end=end30, freq=f"{interval}min", tz=_tz)
+
+    # 2) In each 30-min bucket, keep the LAST cumulative value
+    s_last = (
+        df.set_index("ds")["y"].groupby(pd.Grouper(freq=f"{interval}min")).last()
+    )
+
+    # 3) Forward/backward fill short gaps so we can take diffs robustly
+    s_last = s_last.reindex(idx)
+    s_last = s_last.ffill().bfill()
+
+    # 4) Compute interval increments PER DAY (handle daily reset)
+    #    Take the diff within each day; negatives (from reset) are set to 0.
     if reset_daily:
-        # Enforce same-day monotonic non-decreasing by cumulative max per day
-        day_idx = s_day.index.tz_convert("UTC").normalize()
-        s_day = s_day.groupby(day_idx).cummax()
+        s_inc = (
+            s_last.groupby(s_last.index.floor("D"))
+            .apply(lambda x: x.diff().clip(lower=0.0))
+        )
+    else:
+        s_inc = s_last.diff().clip(lower=0.0)
 
-    # Interval by within-day diff
-    y = s_day.diff()
-    # New day: allow negative (wrap to 0), else clip negatives to 0 (jitters)
-    is_new_day = s_day.index.normalize() != s_day.index.shift(1).normalize()
-    y[is_new_day] = 0.0
-    y = y.clip(lower=0.0)
+    # After groupby-apply we may get a MultiIndex; flatten it:
+    if isinstance(s_inc.index, pd.MultiIndex):
+        s_inc.index = s_inc.index.get_level_values(-1)
 
-    out = pd.DataFrame({"ds": s_day.index, "y": y.values})
-    # Drop leading NaN from first diff
-    out = out.dropna(subset=["y"]).reset_index(drop=True)
+    # 5) Ensure full 30-min grid and fill any holes with 0 (true “no consumption”)
+    s_inc = s_inc.reindex(idx).fillna(0.0)
 
-    # --- BEGIN enforce regular cadence on interval series ---
-    out = out.sort_values('ds').drop_duplicates(subset=['ds'], keep='last')
-    if out.empty:
-        return out
-    _tz = out['ds'].dt.tz
-    start_ds = out['ds'].min()
-    end_ds = out['ds'].max()
-    start30 = (start_ds.floor('30min') if hasattr(start_ds, 'floor') else start_ds)
-    end30 = (end_ds.ceil('30min')    if hasattr(end_ds, 'ceil')   else end_ds)
-    idx = pd.date_range(start=start30, end=end30, freq=f"{freq_minutes}min", tz=_tz)
+    out = s_inc.reset_index()
+    out.columns = ["ds", "y"]
 
-    s = (
-        out.set_index('ds')['y']
-        .groupby(pd.Grouper(freq=f'{freq_minutes}min'))
-        .sum(min_count=1)
-    )
+    # 6) Small numeric clean-up
+    out["y"] = out["y"].astype(float)
+    out.loc[out["y"].abs() < 1e-6, "y"] = 0.0
 
-    s = s.reindex(idx).fillna(0.0)
-    s = s.rename('y')
-    out = s.reset_index().rename(columns={'index': 'ds'})
-    # --- END enforce regular cadence on interval series ---
     logger.debug(
-        "Interval series regularised: rows=%d, span=%s→%s",
+        "Interval series regularised: rows=%d, span=%s→%s, nonzero_share=%.2f%%",
         len(out),
-        out['ds'].min(),
-        out['ds'].max(),
+        out["ds"].min(),
+        out["ds"].max(),
+        100.0 * (out["y"] > 0).mean() if len(out) else 0.0,
     )
+
+    _delta_counts = out.set_index("ds").index.to_series().diff().value_counts(dropna=True)
+    if not (
+        len(_delta_counts) == 1
+        and _delta_counts.index[0] == pd.Timedelta(minutes=interval)
+    ):
+        logger.warning("Cadence irregular after repair; counts=%s", dict(_delta_counts))
+        raise RuntimeError("Cadence irregular after repair")
+
     return out
 
 
@@ -2051,16 +2058,18 @@ async def run_sensor_job(sensor: SensorCfg,
         )
 
         train_df = train_df.dropna(subset=["y"])
-        _delta_counts = train_df.set_index("ds").index.to_series().diff().value_counts(dropna=True)
+        _delta_counts = (
+            train_df.set_index("ds").index.to_series().diff().value_counts(dropna=True)
+        )
         if not (
             len(_delta_counts) == 1
             and _delta_counts.index[0] == pd.Timedelta(minutes=interval_min)
         ):
             logger.warning(
-                "Cadence still irregular after reindex (unexpected). Counts=%s",
+                "Cadence irregular after repair; counts=%s",
                 dict(_delta_counts),
             )
-            raise RuntimeError("Cadence irregular even after repair; skipping this cycle.")
+            raise RuntimeError("Cadence irregular after repair")
 
         # Log a summary after imputation
         summarise_df(f"train_imputed.{sensor.name}", train_df)
