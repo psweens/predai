@@ -283,6 +283,10 @@ def timestr_to_datetime(timestamp: str) -> Optional[datetime]:
     return None
 
 
+def parse_time_aware(s: Optional[str]) -> Optional[datetime]:
+    return timestr_to_datetime(s) if s else None
+
+
 def ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
@@ -570,21 +574,76 @@ class HAInterface:
             return None
 
     async def get_history(self, sensor: str, start: datetime, end: datetime) -> Tuple[List[dict], Optional[datetime], Optional[datetime]]:
-        params = {
-            "filter_entity_id": sensor,
-            "end_time": end.strftime(TIME_FORMAT_HA),
-        }
-        endpoint = "/api/history/period/" + start.strftime(TIME_FORMAT_HA)
-        res = await self.api_call("GET", endpoint, params=params)
-        if not res:
+        """
+        Fetch HA history for `sensor` between start and end, preferring non-compressed
+        responses. If the first attempt yields <=1 state, retry by chunking the window
+        to avoid HA recorder compression/glitches.
+        """
+
+        def _mk_params(end_dt: datetime) -> dict:
+            return {
+                "filter_entity_id": sensor,
+                "end_time": end_dt.strftime(TIME_FORMAT_HA),
+                # ask HA not to compress results
+                "significant_changes_only": "0",
+                "minimal_response": "0",
+                # cut attrs to shrink payload (we don't use them here)
+                "no_attributes": "1",
+                # ensure the first sample of the period is included
+                "include_start_time": "1",
+            }
+
+        endpoint_base = "/api/history/period/"
+        endpoint = endpoint_base + start.strftime(TIME_FORMAT_HA)
+
+        # --- First attempt: full range, non-compressed
+        res = await self.api_call("GET", endpoint, params=_mk_params(end))
+        arr: List[dict] = res[0] if isinstance(res, list) and res else []
+
+        # Helper to choose the best timestamp field available
+        def _row_ts(row: dict) -> Optional[str]:
+            return row.get("last_updated") or row.get("last_changed")
+
+        # If HA returned 0/1 rows, do a chunked retry to beat compression
+        if len(arr) <= 1:
+            logger.warning("History for %s returned %d rows; retrying in chunks", sensor, len(arr))
+            arr = []
+            chunk_days = 3
+            cur = start
+            while cur < end:
+                chunk_end = min(cur + timedelta(days=chunk_days), end)
+                res_chunk = await self.api_call("GET", endpoint_base + cur.strftime(TIME_FORMAT_HA), params=_mk_params(chunk_end))
+                chunk = res_chunk[0] if isinstance(res_chunk, list) and res_chunk else []
+                if chunk:
+                    arr.extend(chunk)
+                cur = chunk_end
+
+        def _dedup_rows(rows: List[dict]) -> List[dict]:
+            seen: set[datetime] = set()
+            dedup: List[dict] = []
+            for r in rows:
+                ts_val = _row_ts(r)
+                dt = parse_time_aware(ts_val)
+                if not dt or dt in seen:
+                    continue
+                seen.add(dt)
+                dedup.append(r)
+            return dedup
+
+        arr = _dedup_rows(arr)
+
+        if not arr:
             logger.warning("No history for %s", sensor)
             return [], None, None
-        arr = res[0] if isinstance(res, list) and res else []
+
+        # Sort by timestamp and compute start/end
         try:
-            st = timestr_to_datetime(arr[0]["last_updated"]) if arr else None
-            en = timestr_to_datetime(arr[-1]["last_updated"]) if arr else None
+            arr.sort(key=lambda r: parse_time_aware(_row_ts(r)))
+            st = parse_time_aware(_row_ts(arr[0]))
+            en = parse_time_aware(_row_ts(arr[-1]))
         except Exception:
             st = en = None
+
         return arr, st, en
 
     async def get_state(self, entity_id: str, default: Any = None, attribute: Optional[str] = None):
@@ -712,26 +771,41 @@ def normalise_history(raw: list[dict]) -> pd.DataFrame:
     if not raw:
         return pd.DataFrame(columns=["ds", "value"])
 
-    df = pd.DataFrame(raw)
+    rows: List[dict] = []
+    for r in raw:
+        ts_raw = r.get("last_updated") or r.get("last_changed")
+        ds = timestr_to_datetime(ts_raw)
+        if not ds:
+            continue
+        ds = ensure_utc(ds)
 
-    # Prefer 'last_updated', fall back to 'last_changed' if needed
-    ts_col = "last_updated" if "last_updated" in df.columns else (
-        "last_changed" if "last_changed" in df.columns else None
-    )
-    if ts_col is None:
-        # Graceful fallback if upstream shape changes
+        state_val = r.get("state")
+        value = _state_to_float(state_val)
+        if value is None:
+            try:
+                value = float(state_val)
+            except Exception:
+                value = None
+
+        if value is None or not np.isfinite(value):
+            continue
+
+        rows.append({"ds": pd.to_datetime(ds, utc=True), "value": float(value)})
+
+    if not rows:
         return pd.DataFrame(columns=["ds", "value"])
 
-    df["ds"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-
-    # Map boolean-ish states to floats, else try numeric
-    coerced = df["state"].map(_state_to_float)
-    numeric = pd.to_numeric(df["state"], errors="coerce")
-    df["value"] = coerced.where(coerced.notna(), numeric).astype("float32")
-
-    # De-dupe & sort
-    df = df.dropna(subset=["ds", "value"]).sort_values("ds")
+    df = pd.DataFrame(rows)
+    df = df.sort_values("ds")
     df = df.drop_duplicates(subset=["ds"], keep="last")
+    df["value"] = df["value"].astype("float32")
+
+    if len(df) <= 1:
+        logger.error(
+            "Normalised history collapsed to %d row(s) from %d raw rows.",
+            len(df),
+            len(raw),
+        )
 
     logger.debug("Normalised history result rows=%s", len(df))
     return df[["ds", "value"]]
