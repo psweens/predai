@@ -1982,7 +1982,17 @@ async def run_sensor_job(sensor: SensorCfg,
                     sensor.name, len(df_future),
                     (not deltas.empty and deltas.index[0] == pd.Timedelta(minutes=30)),
                     list(df_future['ds'].head(3)), list(df_future['ds'].tail(3)))
-        fcst = backend.predict(df_future)
+        # NeuralProphet requirement:
+        # - Lagged covariates must NOT be present in the predict() dataframe.
+        # - For keep_history=True, we may include 'y' for the historical rows, but it's optional.
+        # Build a slim NP input with only ['ds'] (and 'y' if present).
+        _np_cols = [c for c in ["ds", "y"] if c in df_future.columns]
+        df_np = df_future[_np_cols].copy()
+        logger.debug("NP predict input columns: %s", list(df_np.columns))
+
+        # Extra safety: ensure no unexpected columns sneak in.
+        # (NeuralProphet will error if unknown columns are present.)
+        fcst = backend.predict(df_np)
         fcst["ds"] = pd.to_datetime(fcst["ds"], utc=True)
         summarise_df(f"forecast.{sensor.name}", fcst)
 
