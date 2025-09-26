@@ -785,39 +785,64 @@ def normalise_history(raw: list[dict]) -> pd.DataFrame:
         return pd.DataFrame(columns=["ds", "value"])
 
     df = pd.DataFrame(raw)
+    logger.debug("History columns: %s", list(df.columns))
+    logger.debug("Non-null counts: %s", df.notna().sum().to_dict())
 
-    # --- Build a robust timestamp per row ---
-    has_lu = "last_updated" in df.columns
-    has_lc = "last_changed" in df.columns
-    if not (has_lu or has_lc):
-        # Graceful fallback if upstream shape changes
+    # --- Build a robust timestamp per row (ISO and *_ts variants) ---
+    ts_parts = []
+    if "last_updated" in df.columns:
+        ts_parts.append(pd.to_datetime(df["last_updated"], utc=True, errors="coerce"))
+    if "last_changed" in df.columns:
+        ts_parts.append(pd.to_datetime(df["last_changed"], utc=True, errors="coerce"))
+    if "last_updated_ts" in df.columns:
+        ts_parts.append(pd.to_datetime(df["last_updated_ts"], unit="s", utc=True, errors="coerce"))
+    if "last_changed_ts" in df.columns:
+        ts_parts.append(pd.to_datetime(df["last_changed_ts"], unit="s", utc=True, errors="coerce"))
+
+    if not ts_parts:
+        logger.warning("History has no recognised timestamp columns.")
         return pd.DataFrame(columns=["ds", "value"])
 
-    ts = pd.to_datetime(df["last_updated"], utc=True, errors="coerce") if has_lu else None
-    alt = pd.to_datetime(df["last_changed"], utc=True, errors="coerce") if has_lc else None
+    # rowwise coalesce: take the first non-NaT among the candidates
+    ts = ts_parts[0]
+    for part in ts_parts[1:]:
+        ts = ts.fillna(part)
+    df["ds"] = ts
 
-    if ts is None:
-        df["ds"] = alt
-    elif alt is None:
-        df["ds"] = ts
-    else:
-        # Row-wise coalesce: prefer last_updated; fall back to last_changed for rows where it’s missing
-        df["ds"] = ts.fillna(alt)
+    # --- State -> numeric (tolerant to units) ---
+    # 1) binary-ish map
+    coerced = df["state"].map(_state_to_float)
+    # 2) numeric token (handles '13.4 °C', '55%'), fallback to to_numeric
+    if coerced.isna().any():
+        # grab first number in the string if present
+        num_token = (
+            df.loc[coerced.isna(), "state"]
+              .astype(str)
+              .str.extract(r"(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", expand=False)
+        )
+        numeric_from_token = pd.to_numeric(num_token, errors="coerce")
+        coerced = coerced.where(coerced.notna(), numeric_from_token)
 
-    # --- Parse state -> numeric value (binary and numeric states) ---
-    coerced = df["state"].map(_state_to_float)                  # maps on/off etc. to 1/0 (or None)
-    numeric = pd.to_numeric(df["state"], errors="coerce")       # pure numerics
+    # final fallback
+    numeric = pd.to_numeric(df["state"], errors="coerce")
     df["value"] = coerced.where(coerced.notna(), numeric).astype("float32")
 
-    # --- Clean, order, de-dup on timestamp ---
-    n_before = len(df)
+    # --- Clean, order, dedupe ---
+    n0 = len(df)
+    miss_ds = int(df["ds"].isna().sum())
+    miss_val = int(df["value"].isna().sum())
+
     df = df.dropna(subset=["ds", "value"]).sort_values("ds")
+    # if many rows share identical 'ds' (rare), keep the last
     df = df.drop_duplicates(subset=["ds"], keep="last")
+
     logger.debug(
-        "Normalised history result rows=%s (dropped=%s missing_ts_or_value)",
-        len(df), n_before - len(df)
+        "Normalised history: rows=%s (raw=%s, missing ds=%s, missing value=%s)",
+        len(df), n0, miss_ds, miss_val
     )
+    
     return df[["ds", "value"]]
+
 
 
 
