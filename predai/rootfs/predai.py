@@ -778,7 +778,28 @@ def _state_to_float(x) -> float | None:
         return float(s)
     except Exception:
         return None
-        
+    
+
+def _parse_ts_any(x):
+    """Return a UTC pandas.Timestamp or NaT for a single value."""
+    # Fast paths for common types
+    if isinstance(x, pd.Timestamp):
+        return x.tz_convert("UTC") if x.tzinfo is not None else x.tz_localize("UTC")
+    if isinstance(x, datetime):
+        return pd.Timestamp(x.astimezone(timezone.utc)) if x.tzinfo else pd.Timestamp(x, tz="UTC")
+    # Numeric epoch seconds (or numeric-looking string)
+    try:
+        # cheap numeric check
+        if isinstance(x, (int, float, np.integer, np.floating)) or (isinstance(x, str) and x.replace(".","",1).lstrip("-").isdigit()):
+            return pd.to_datetime(x, unit="s", utc=True, errors="coerce")
+    except Exception:
+        pass
+    # Fallback: parse as string (covers ISO8601, with/without Z/offset/micros)
+    try:
+        return pd.to_datetime(str(x), utc=True, errors="coerce")
+    except Exception:
+        return pd.NaT
+
 def normalise_history(raw: list[dict]) -> pd.DataFrame:
     logger.debug("Normalising history with %s raw rows", len(raw))
     if not raw:
@@ -786,44 +807,42 @@ def normalise_history(raw: list[dict]) -> pd.DataFrame:
 
     df = pd.DataFrame(raw)
     logger.debug("History columns: %s", list(df.columns))
-    logger.debug("Non-null counts: %s", df.notna().sum().to_dict())
 
-    # --- Build a robust timestamp per row (ISO and *_ts variants) ---
-    ts_parts = []
-    if "last_updated" in df.columns:
-        ts_parts.append(pd.to_datetime(df["last_updated"], utc=True, errors="coerce"))
-    if "last_changed" in df.columns:
-        ts_parts.append(pd.to_datetime(df["last_changed"], utc=True, errors="coerce"))
-    if "last_updated_ts" in df.columns:
-        ts_parts.append(pd.to_datetime(df["last_updated_ts"], unit="s", utc=True, errors="coerce"))
-    if "last_changed_ts" in df.columns:
-        ts_parts.append(pd.to_datetime(df["last_changed_ts"], unit="s", utc=True, errors="coerce"))
+    # --- Build robust UTC timestamp per row from any of the known fields ---
+    # Collect candidates (whatever exists), then row-wise coalesce first non-NaT
+    candidates = []
+    for col, kind in [
+        ("last_updated", "iso"),
+        ("last_changed", "iso"),
+        ("last_updated_ts", "epoch"),
+        ("last_changed_ts", "epoch"),
+    ]:
+        if col in df.columns:
+            if kind == "epoch":
+                s = pd.to_datetime(df[col], unit="s", utc=True, errors="coerce")
+            else:
+                # apply handles mixed objects/strings/datetimes safely
+                s = df[col].apply(_parse_ts_any)
+            candidates.append(s)
 
-    if not ts_parts:
+    if not candidates:
         logger.warning("History has no recognised timestamp columns.")
         return pd.DataFrame(columns=["ds", "value"])
 
-    # rowwise coalesce: take the first non-NaT among the candidates
-    ts = ts_parts[0]
-    for part in ts_parts[1:]:
-        ts = ts.fillna(part)
-    df["ds"] = ts
+    ds = candidates[0]
+    for s in candidates[1:]:
+        ds = ds.fillna(s)
+    df["ds"] = ds
 
-    # --- State -> numeric (tolerant to units) ---
-    # 1) binary-ish map
-    coerced = df["state"].map(_state_to_float)
-    # 2) numeric token (handles '13.4 °C', '55%'), fallback to to_numeric
+    # --- State → numeric (binary map, numeric-with-units tolerant) ---
+    coerced = df["state"].map(_state_to_float)  # your existing helper
     if coerced.isna().any():
-        # grab first number in the string if present
         num_token = (
             df.loc[coerced.isna(), "state"]
               .astype(str)
               .str.extract(r"(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", expand=False)
         )
-        numeric_from_token = pd.to_numeric(num_token, errors="coerce")
-        coerced = coerced.where(coerced.notna(), numeric_from_token)
-
-    # final fallback
+        coerced = coerced.where(coerced.notna(), pd.to_numeric(num_token, errors="coerce"))
     numeric = pd.to_numeric(df["state"], errors="coerce")
     df["value"] = coerced.where(coerced.notna(), numeric).astype("float32")
 
@@ -831,19 +850,19 @@ def normalise_history(raw: list[dict]) -> pd.DataFrame:
     n0 = len(df)
     miss_ds = int(df["ds"].isna().sum())
     miss_val = int(df["value"].isna().sum())
+    # (optional) peek a few problematic rows to debug formats
+    bad_sample = df.loc[df["ds"].isna(), ["last_updated","last_changed"]].head(3).to_dict("records")
+    if bad_sample:
+        logger.debug("Sample rows with unparseable timestamps: %s", bad_sample)
 
     df = df.dropna(subset=["ds", "value"]).sort_values("ds")
-    # if many rows share identical 'ds' (rare), keep the last
     df = df.drop_duplicates(subset=["ds"], keep="last")
 
     logger.debug(
         "Normalised history: rows=%s (raw=%s, missing ds=%s, missing value=%s)",
         len(df), n0, miss_ds, miss_val
     )
-    
     return df[["ds", "value"]]
-
-
 
 
 def _complete_grid_after_resample(df: pd.DataFrame, freq: str, how: str, tz=None, ds_col: str = "ds", val_col: str = "y") -> pd.DataFrame:
