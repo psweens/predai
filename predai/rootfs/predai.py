@@ -778,7 +778,7 @@ def _state_to_float(x) -> float | None:
         return float(s)
     except Exception:
         return None
-
+        
 def normalise_history(raw: list[dict]) -> pd.DataFrame:
     logger.debug("Normalising history with %s raw rows", len(raw))
     if not raw:
@@ -786,27 +786,39 @@ def normalise_history(raw: list[dict]) -> pd.DataFrame:
 
     df = pd.DataFrame(raw)
 
-    # Prefer 'last_updated', fall back to 'last_changed' if needed
-    ts_col = "last_updated" if "last_updated" in df.columns else (
-        "last_changed" if "last_changed" in df.columns else None
-    )
-    if ts_col is None:
+    # --- Build a robust timestamp per row ---
+    has_lu = "last_updated" in df.columns
+    has_lc = "last_changed" in df.columns
+    if not (has_lu or has_lc):
         # Graceful fallback if upstream shape changes
         return pd.DataFrame(columns=["ds", "value"])
 
-    df["ds"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+    ts = pd.to_datetime(df["last_updated"], utc=True, errors="coerce") if has_lu else None
+    alt = pd.to_datetime(df["last_changed"], utc=True, errors="coerce") if has_lc else None
 
-    # Map boolean-ish states to floats, else try numeric
-    coerced = df["state"].map(_state_to_float)
-    numeric = pd.to_numeric(df["state"], errors="coerce")
+    if ts is None:
+        df["ds"] = alt
+    elif alt is None:
+        df["ds"] = ts
+    else:
+        # Row-wise coalesce: prefer last_updated; fall back to last_changed for rows where it’s missing
+        df["ds"] = ts.fillna(alt)
+
+    # --- Parse state -> numeric value (binary and numeric states) ---
+    coerced = df["state"].map(_state_to_float)                  # maps on/off etc. to 1/0 (or None)
+    numeric = pd.to_numeric(df["state"], errors="coerce")       # pure numerics
     df["value"] = coerced.where(coerced.notna(), numeric).astype("float32")
 
-    # De-dupe & sort
+    # --- Clean, order, de-dup on timestamp ---
+    n_before = len(df)
     df = df.dropna(subset=["ds", "value"]).sort_values("ds")
     df = df.drop_duplicates(subset=["ds"], keep="last")
-
-    logger.debug("Normalised history result rows=%s", len(df))
+    logger.debug(
+        "Normalised history result rows=%s (dropped=%s missing_ts_or_value)",
+        len(df), n_before - len(df)
+    )
     return df[["ds", "value"]]
+
 
 
 def _complete_grid_after_resample(df: pd.DataFrame, freq: str, how: str, tz=None, ds_col: str = "ds", val_col: str = "y") -> pd.DataFrame:
